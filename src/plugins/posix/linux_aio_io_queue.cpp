@@ -27,9 +27,14 @@
 
 struct nixlPosixLinuxAioIO {
 public:
+    int fd_ = -1;
+    void *buf_ = nullptr;
+    off_t offset_ = 0;
+    bool read_ = false;
     nixlPosixIOQueueDoneCb clb_;
     void *ctx_ = nullptr;
     size_t len_ = 0;
+    size_t total_len_ = 0;
     bool in_flight_ = false;
     struct iocb io_;
 };
@@ -59,8 +64,10 @@ protected:
     doCheckCompleted(void);
 
 private:
+    void
+    prepareIO(nixlPosixLinuxAioIO *io);
     bool
-    completeIO(nixlPosixLinuxAioIO *io, int64_t result);
+    completeIO(nixlPosixLinuxAioIO *io, int64_t result, bool retry_partial_read = true);
     void
     failIO(nixlPosixLinuxAioIO *io);
     void
@@ -106,19 +113,29 @@ nixlPosixIOQueueLinuxAIO::enqueue(int fd,
     nixlPosixLinuxAioIO *io = free_ios_.front();
     free_ios_.pop_front();
 
-    if (read) {
-        io_prep_pread(&io->io_, fd, buf, len, offset);
-    } else {
-        io_prep_pwrite(&io->io_, fd, buf, len, offset);
-    }
+    io->fd_ = fd;
+    io->buf_ = buf;
+    io->offset_ = offset;
+    io->read_ = read;
     io->clb_ = clb;
     io->ctx_ = ctx;
     io->len_ = len;
+    io->total_len_ = len;
     io->in_flight_ = false;
-    io->io_.data = io;
+    prepareIO(io);
     ios_to_submit_.push_back(io);
 
     return NIXL_SUCCESS;
+}
+
+void
+nixlPosixIOQueueLinuxAIO::prepareIO(nixlPosixLinuxAioIO *io) {
+    if (io->read_) {
+        io_prep_pread(&io->io_, io->fd_, io->buf_, io->len_, io->offset_);
+    } else {
+        io_prep_pwrite(&io->io_, io->fd_, io->buf_, io->len_, io->offset_);
+    }
+    io->io_.data = io;
 }
 
 nixlPosixIOQueueLinuxAIO::~nixlPosixIOQueueLinuxAIO() {
@@ -183,9 +200,31 @@ nixlPosixIOQueueLinuxAIO::requeueFrom(nixlPosixLinuxAioIO *const *ios, int first
 }
 
 bool
-nixlPosixIOQueueLinuxAIO::completeIO(nixlPosixLinuxAioIO *io, int64_t result) {
+nixlPosixIOQueueLinuxAIO::completeIO(nixlPosixLinuxAioIO *io,
+                                     int64_t result,
+                                     bool retry_partial_read) {
     NIXL_ASSERT(io->in_flight_);
-    bool error = result < 0 || static_cast<size_t>(result) != io->len_;
+    bool error = result < 0 || (result == 0 && io->len_ != 0) ||
+        static_cast<size_t>(result) > io->len_ ||
+        (!io->read_ && static_cast<size_t>(result) != io->len_);
+    if (!error && static_cast<size_t>(result) < io->len_) {
+        if (!retry_partial_read) {
+            error = true;
+        } else {
+            size_t completed = static_cast<size_t>(result);
+            NIXL_DEBUG << absl::StrFormat(
+                "AIO read completed partially: %zu of %zu bytes; resubmitting remainder",
+                completed,
+                io->len_);
+            io->buf_ = static_cast<char *>(io->buf_) + completed;
+            io->offset_ += completed;
+            io->len_ -= completed;
+            io->in_flight_ = false;
+            prepareIO(io);
+            ios_to_submit_.push_back(io);
+            return false;
+        }
+    }
     if (error) {
         NIXL_DEBUG << absl::StrFormat(
             "AIO operation incomplete: result %ld, expected %zu", result, io->len_);
@@ -195,7 +234,7 @@ nixlPosixIOQueueLinuxAIO::completeIO(nixlPosixLinuxAioIO *io, int64_t result) {
 
     io->in_flight_ = false;
     if (io->clb_) {
-        io->clb_(io->ctx_, static_cast<uint32_t>(result), 0);
+        io->clb_(io->ctx_, static_cast<uint32_t>(io->total_len_), 0);
     }
     free_ios_.push_back(io);
     return false;
@@ -309,7 +348,7 @@ nixlPosixIOQueueLinuxAIO::cancel(void *ctx, nixlPosixIOQueueCancelDoneCb) {
         struct io_event event{};
         if (io_cancel(io_ctx_, &io.io_, &event) == 0) {
             // io_cancel returns the canceled operation's completion synchronously.
-            completeIO(&io, event.res);
+            completeIO(&io, event.res, false);
         }
     }
 

@@ -6,6 +6,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -31,6 +32,7 @@ enum class submitMode {
     TRANSIENT_ONCE,
     PARTIAL_THEN_ERROR,
     COMPLETION_ERROR,
+    SHORT_READ,
     TERMINAL_CONTEXT
 };
 submitMode submit_mode = submitMode::PASS_THROUGH;
@@ -42,6 +44,10 @@ long first_requested = 0;
 int first_submitted = 0;
 bool completion_error_injected = false;
 int submissions_after_completion_error = 0;
+int short_read_completions = 0;
+std::vector<size_t> short_read_lengths;
+std::vector<off_t> short_read_offsets;
+std::vector<uintptr_t> short_read_buffers;
 
 struct completionState {
     int completions = 0;
@@ -122,9 +128,14 @@ struct aioTest {
 struct aioRequest {
     nixl_meta_dlist_t local{DRAM_SEG};
     nixl_meta_dlist_t remote{FILE_SEG};
+    nixl_xfer_op_t operation;
     nixlPosixBackendReqH request;
 
-    aioRequest(aioTest &test, nixlPosixFileMD &file_md, int first, int count)
+    aioRequest(aioTest &test,
+               nixlPosixFileMD &file_md,
+               int first,
+               int count,
+               nixl_xfer_op_t op = NIXL_WRITE)
         : local([&] {
               nixl_meta_dlist_t list(DRAM_SEG);
               for (int i = first; i < first + count; i++) {
@@ -140,7 +151,8 @@ struct aioRequest {
               }
               return list;
           }()),
-          request(NIXL_WRITE, local, remote, test.queue) {}
+          operation(op),
+          request(operation, local, remote, test.queue) {}
 };
 
 nixl_status_t
@@ -163,6 +175,10 @@ setSubmitMode(submitMode mode) {
     first_submitted = 0;
     completion_error_injected = false;
     submissions_after_completion_error = 0;
+    short_read_completions = 0;
+    short_read_lengths.clear();
+    short_read_offsets.clear();
+    short_read_buffers.clear();
 }
 
 #define AIO_CHECK(condition)                                                                      \
@@ -187,6 +203,16 @@ io_submit(io_context_t ctx, long nr, struct iocb **iocbpp) {
         submissions_after_completion_error++;
     }
     submit_calls++;
+    if (submit_mode == submitMode::SHORT_READ) {
+        for (long i = 0; i < nr; i++) {
+            if (iocbpp[i]->aio_lio_opcode != IO_CMD_PREAD) {
+                continue;
+            }
+            short_read_lengths.push_back(iocbpp[i]->u.c.nbytes);
+            short_read_offsets.push_back(iocbpp[i]->u.c.offset);
+            short_read_buffers.push_back(reinterpret_cast<uintptr_t>(iocbpp[i]->u.c.buf));
+        }
+    }
     if (submit_calls == 1) {
         first_requested = nr;
         if (submit_mode == submitMode::TRANSIENT_ONCE) {
@@ -260,7 +286,16 @@ io_getevents(io_context_t ctx,
         }
         return rc;
     }
-    return real_getevents(ctx, min_nr, nr, events, timeout);
+    int rc = real_getevents(ctx, min_nr, nr, events, timeout);
+    if (submit_mode == submitMode::SHORT_READ && rc > 0 && short_read_completions < 2) {
+        for (int i = 0; i < rc && short_read_completions < 2; i++) {
+            if (events[i].obj->aio_lio_opcode == IO_CMD_PREAD && events[i].res > 1) {
+                events[i].res /= 2;
+                short_read_completions++;
+            }
+        }
+    }
+    return rc;
 }
 
 int
@@ -284,6 +319,72 @@ main() {
         AIO_CHECK(test.drain() == NIXL_SUCCESS);
         AIO_CHECK(submit_calls > 1);
         AIO_CHECK(state.completions == request_count && state.errors == 0);
+    }
+    {
+        setSubmitMode(submitMode::SHORT_READ);
+        aioTest test(1);
+        std::array<char, block_size> expected;
+        std::memset(expected.data(), 0x5a, expected.size());
+        AIO_CHECK(pwrite(test.fd, expected.data(), expected.size(), 0) ==
+                  static_cast<ssize_t>(expected.size()));
+        std::memset(test.buffers[0].data(), 0, block_size);
+
+        nixlPosixFileMD file_md(test.fd, "");
+        aioRequest read(test, file_md, 0, 1, NIXL_READ);
+        nixl_status_t status = read.request.postXfer();
+        AIO_CHECK(status == NIXL_IN_PROG);
+
+        for (int expected_completions = 1; expected_completions <= 2; expected_completions++) {
+            for (int i = 0; i < max_poll_iterations &&
+                 short_read_completions < expected_completions && status == NIXL_IN_PROG;
+                 i++) {
+                status = read.request.checkXfer();
+                std::this_thread::sleep_for(poll_pause);
+            }
+            AIO_CHECK(short_read_completions == expected_completions);
+            AIO_CHECK(status == NIXL_IN_PROG);
+        }
+
+        AIO_CHECK(waitFor(read, status) == NIXL_SUCCESS);
+        AIO_CHECK(short_read_lengths.size() == 3);
+        AIO_CHECK(short_read_lengths[0] == block_size);
+        AIO_CHECK(short_read_lengths[1] == block_size / 2);
+        AIO_CHECK(short_read_lengths[2] == block_size / 4);
+        AIO_CHECK(short_read_offsets[0] == 0);
+        AIO_CHECK(short_read_offsets[1] == static_cast<off_t>(block_size / 2));
+        AIO_CHECK(short_read_offsets[2] == static_cast<off_t>(3 * block_size / 4));
+        uintptr_t first_buffer = reinterpret_cast<uintptr_t>(test.buffers[0].data());
+        AIO_CHECK(short_read_buffers[0] == first_buffer);
+        AIO_CHECK(short_read_buffers[1] == first_buffer + block_size / 2);
+        AIO_CHECK(short_read_buffers[2] == first_buffer + 3 * block_size / 4);
+        AIO_CHECK(std::memcmp(test.buffers[0].data(), expected.data(), block_size) == 0);
+    }
+    {
+        setSubmitMode(submitMode::PASS_THROUGH);
+        aioTest test(1);
+        nixlPosixFileMD file_md(test.fd, "");
+        aioRequest read_past_eof(test, file_md, 0, 1, NIXL_READ);
+
+        AIO_CHECK(read_past_eof.request.postXfer() == NIXL_IN_PROG);
+        AIO_CHECK(waitFor(read_past_eof) == NIXL_ERR_BACKEND);
+        AIO_CHECK(submit_calls == 1);
+    }
+    {
+        setSubmitMode(submitMode::PASS_THROUGH);
+        aioTest test(1);
+        std::array<char, block_size> expected;
+        std::memset(expected.data(), 0x6b, expected.size());
+        AIO_CHECK(pwrite(test.fd, expected.data(), expected.size(), 0) ==
+                  static_cast<ssize_t>(expected.size()));
+        AIO_CHECK(ftruncate(test.fd, block_size / 2) == 0);
+        std::memset(test.buffers[0].data(), 0, block_size);
+
+        nixlPosixFileMD file_md(test.fd, "");
+        aioRequest read_truncated(test, file_md, 0, 1, NIXL_READ);
+        AIO_CHECK(read_truncated.request.postXfer() == NIXL_IN_PROG);
+        AIO_CHECK(waitFor(read_truncated) == NIXL_ERR_BACKEND);
+        AIO_CHECK(submit_calls == 2);
+        AIO_CHECK(std::memcmp(test.buffers[0].data(), expected.data(), block_size / 2) == 0);
     }
     {
         setSubmitMode(submitMode::PARTIAL_THEN_ERROR);

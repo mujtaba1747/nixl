@@ -5,6 +5,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -27,10 +28,15 @@ constexpr size_t block_size = 4096;
 constexpr auto poll_pause = std::chrono::microseconds(50);
 using buffers_t = std::array<std::array<char, block_size>, request_count>;
 
-enum class submit_mode_t { PARTIAL_ONLY, TRANSIENT_ERRORS, PASS_THROUGH };
+enum class submit_mode_t { PARTIAL_ONLY, TRANSIENT_ERRORS, SHORT_READ, PASS_THROUGH };
 submit_mode_t submit_mode = submit_mode_t::PASS_THROUGH;
 int submit_calls = 0, transient_submit_errors = 0, cancel_completions = 0;
 unsigned first_ready = 0, first_submitted = 0;
+int read_submissions = 0;
+int short_read_submissions = 0;
+std::array<unsigned, 3> short_read_lengths{};
+std::array<off_t, 3> short_read_offsets{};
+std::array<uintptr_t, 3> short_read_buffers{};
 
 struct completionState {
     int count = 0, errors = 0;
@@ -58,6 +64,11 @@ struct uringTest {
         submit_mode = mode;
         submit_calls = transient_submit_errors = cancel_completions = first_ready =
             first_submitted = 0;
+        read_submissions = 0;
+        short_read_submissions = 0;
+        short_read_lengths.fill(0);
+        short_read_offsets.fill(0);
+        short_read_buffers.fill(0);
         char path[] = "/tmp/nixl_uring_test_XXXXXX";
         if ((fd = mkstemp(path)) < 0) {
             throw std::runtime_error("mkstemp failed");
@@ -106,7 +117,10 @@ struct uringRequest {
     nixl_xfer_op_t operation = NIXL_WRITE;
     nixlPosixBackendReqH request;
 
-    uringRequest(uringTest &test, nixlPosixFileMD &file_md, int index)
+    uringRequest(uringTest &test,
+                 nixlPosixFileMD &file_md,
+                 int index,
+                 nixl_xfer_op_t op = NIXL_WRITE)
         : local([&] {
               nixl_meta_dlist_t list(DRAM_SEG);
               list.addDesc(nixlMetaDesc(
@@ -118,6 +132,7 @@ struct uringRequest {
               list.addDesc(nixlMetaDesc(index * block_size, block_size, test.fd, &file_md));
               return list;
           }()),
+          operation(op),
           request(operation, local, remote, test.queue) {}
 };
 
@@ -144,6 +159,31 @@ io_uring_submit(struct io_uring *ring) LIBURING_NOEXCEPT {
     }
 
     const unsigned ready = io_uring_sq_ready(ring);
+    for (unsigned i = 0; i < ready; i++) {
+        unsigned index = (ring->sq.sqe_head + i) & *ring->sq.kring_mask;
+        if (ring->sq.sqes[index].opcode == IORING_OP_READ) {
+            read_submissions++;
+        }
+    }
+    if (submit_mode == submit_mode_t::SHORT_READ) {
+        for (unsigned i = 0; i < ready; i++) {
+            unsigned index = (ring->sq.sqe_head + i) & *ring->sq.kring_mask;
+            struct io_uring_sqe *sqe = &ring->sq.sqes[index];
+            if (sqe->opcode != IORING_OP_READ) {
+                continue;
+            }
+            if (short_read_submissions < static_cast<int>(short_read_lengths.size())) {
+                short_read_lengths[short_read_submissions] = sqe->len;
+                short_read_offsets[short_read_submissions] = sqe->off;
+                short_read_buffers[short_read_submissions] = sqe->addr;
+            }
+            if (short_read_submissions < 2) {
+                sqe->len /= 2;
+            }
+            short_read_submissions++;
+        }
+        return real_submit(ring);
+    }
     if (ready == 0 || submit_mode == submit_mode_t::PASS_THROUGH || ++submit_calls != 1 ||
         ready < 2) {
         return real_submit(ring);
@@ -186,6 +226,83 @@ main() {
         URING_CHECK(test.queue->post() == NIXL_IN_PROG);
         URING_CHECK(test.drain() == NIXL_SUCCESS && transient_submit_errors == 1);
         URING_CHECK(state.count == request_count && !state.errors);
+    }
+    {
+        uringTest test(submit_mode_t::SHORT_READ);
+        std::array<char, block_size> expected;
+        std::memset(expected.data(), 0x5a, expected.size());
+        URING_CHECK(pwrite(test.fd, expected.data(), expected.size(), 0) ==
+                    static_cast<ssize_t>(expected.size()));
+        std::memset(test.buffers[0].data(), 0, block_size);
+
+        nixlPosixFileMD file_md(test.fd, "");
+        uringRequest read(test, file_md, 0, NIXL_READ);
+        nixl_status_t status = read.request.postXfer();
+        URING_CHECK(status == NIXL_IN_PROG);
+        URING_CHECK(short_read_submissions == 1);
+
+        for (int expected_submissions = 2; expected_submissions <= 3; expected_submissions++) {
+            for (int i = 0; i < max_poll_iterations &&
+                 short_read_submissions < expected_submissions && status == NIXL_IN_PROG;
+                 i++) {
+                status = read.request.checkXfer();
+                std::this_thread::sleep_for(poll_pause);
+            }
+            URING_CHECK(short_read_submissions == expected_submissions);
+            URING_CHECK(status == NIXL_IN_PROG);
+        }
+
+        for (int i = 0; i < max_poll_iterations && status == NIXL_IN_PROG; i++) {
+            status = read.request.checkXfer();
+            std::this_thread::sleep_for(poll_pause);
+        }
+        URING_CHECK(status == NIXL_SUCCESS);
+        URING_CHECK(short_read_lengths[0] == block_size);
+        URING_CHECK(short_read_lengths[1] == block_size / 2);
+        URING_CHECK(short_read_lengths[2] == block_size / 4);
+        URING_CHECK(short_read_offsets[0] == 0);
+        URING_CHECK(short_read_offsets[1] == static_cast<off_t>(block_size / 2));
+        URING_CHECK(short_read_offsets[2] == static_cast<off_t>(3 * block_size / 4));
+        uintptr_t first_buffer = reinterpret_cast<uintptr_t>(test.buffers[0].data());
+        URING_CHECK(short_read_buffers[0] == first_buffer);
+        URING_CHECK(short_read_buffers[1] == first_buffer + block_size / 2);
+        URING_CHECK(short_read_buffers[2] == first_buffer + 3 * block_size / 4);
+        URING_CHECK(std::memcmp(test.buffers[0].data(), expected.data(), block_size) == 0);
+    }
+    {
+        uringTest test(submit_mode_t::PASS_THROUGH);
+        nixlPosixFileMD file_md(test.fd, "");
+        uringRequest read_past_eof(test, file_md, 0, NIXL_READ);
+
+        URING_CHECK(read_past_eof.request.postXfer() == NIXL_IN_PROG);
+        nixl_status_t status = NIXL_IN_PROG;
+        for (int i = 0; i < max_poll_iterations && status == NIXL_IN_PROG; i++) {
+            status = read_past_eof.request.checkXfer();
+            std::this_thread::sleep_for(poll_pause);
+        }
+        URING_CHECK(status == NIXL_ERR_BACKEND);
+        URING_CHECK(read_submissions == 1);
+    }
+    {
+        uringTest test(submit_mode_t::PASS_THROUGH);
+        std::array<char, block_size> expected;
+        std::memset(expected.data(), 0x6b, expected.size());
+        URING_CHECK(pwrite(test.fd, expected.data(), expected.size(), 0) ==
+                    static_cast<ssize_t>(expected.size()));
+        URING_CHECK(ftruncate(test.fd, block_size / 2) == 0);
+        std::memset(test.buffers[0].data(), 0, block_size);
+
+        nixlPosixFileMD file_md(test.fd, "");
+        uringRequest read_truncated(test, file_md, 0, NIXL_READ);
+        nixl_status_t status = read_truncated.request.postXfer();
+        URING_CHECK(status == NIXL_IN_PROG);
+        for (int i = 0; i < max_poll_iterations && status == NIXL_IN_PROG; i++) {
+            status = read_truncated.request.checkXfer();
+            std::this_thread::sleep_for(poll_pause);
+        }
+        URING_CHECK(status == NIXL_ERR_BACKEND);
+        URING_CHECK(read_submissions == 2);
+        URING_CHECK(std::memcmp(test.buffers[0].data(), expected.data(), block_size / 2) == 0);
     }
     {
         uringTest test(submit_mode_t::PASS_THROUGH);

@@ -42,10 +42,12 @@ struct nixlPosixIoUringIO : public nixlPosixIoUringCQEData {
     int fd;
     void *buf_;
     size_t len_;
+    size_t total_len_;
     off_t offset_;
     bool read_;
     nixlPosixIOQueueDoneCb clb_;
     bool in_flight_ = false; // owned by the ring, not yet reaped
+    bool cancel_requested_ = false;
     bool cancel_pending_ = false; // cancellation is queued or its CQE is pending
 };
 
@@ -217,15 +219,40 @@ nixlPosixIOQueueUring::doCheckCompleted(void) {
             cancel->ctx_ = nullptr;
         } else {
             io = static_cast<nixlPosixIoUringIO *>(data);
-            int error = res < 0 || static_cast<size_t>(res) != io->len_;
+            size_t completed = res < 0 ? 0 : static_cast<size_t>(res);
+            bool error = res < 0 || (completed == 0 && io->len_ != 0) || completed > io->len_ ||
+                (!io->read_ && completed != io->len_);
+            bool retry = !error && completed < io->len_ && !io->cancel_requested_;
+            if (retry) {
+                NIXL_DEBUG << absl::StrFormat(
+                    "io_uring read completed partially: %zu of %zu bytes; resubmitting remainder",
+                    completed,
+                    io->len_);
+                io->buf_ = static_cast<char *>(io->buf_) + completed;
+                io->offset_ += completed;
+                io->len_ -= completed;
+                io->in_flight_ = false;
+                ios_to_submit_.push_back(io);
+            } else if (!error && completed < io->len_) {
+                // Do not resubmit an incomplete read after cancellation was requested.
+                error = true;
+            }
             if (error) {
                 NIXL_DEBUG << absl::StrFormat(
                     "IO operation incomplete: result %d, expected %zu", res, io->len_);
             }
-            if (io->clb_) {
-                io->clb_(io->ctx_, error ? 0 : static_cast<uint32_t>(res), error);
+            if (!retry && io->clb_) {
+                io->clb_(io->ctx_, error ? 0 : static_cast<uint32_t>(io->total_len_), error);
             }
-            io->in_flight_ = false;
+            if (!retry) {
+                io->in_flight_ = false;
+            }
+            if (retry) {
+                if (++count == MAX_IO_CHECK_COMPLETED_BATCH_SIZE) {
+                    break;
+                }
+                continue;
+            }
         }
         releaseIOIfIdle(io);
         if (++count == MAX_IO_CHECK_COMPLETED_BATCH_SIZE) {
@@ -261,11 +288,13 @@ nixlPosixIOQueueUring::enqueue(int fd,
     io->fd = fd;
     io->buf_ = buf;
     io->len_ = len;
+    io->total_len_ = len;
     io->offset_ = offset;
     io->read_ = read;
     io->clb_ = clb;
     io->ctx_ = ctx;
     io->in_flight_ = false;
+    io->cancel_requested_ = false;
     io->cancel_pending_ = false;
 
     ios_to_submit_.push_back(io);
@@ -298,6 +327,7 @@ nixlPosixIOQueueUring::cancel(void *ctx, nixlPosixIOQueueCancelDoneCb clb) {
     for (auto &io : ios_) {
         if (io.in_flight_ && io.ctx_ == ctx && !io.cancel_pending_) {
             size_t index = static_cast<size_t>(&io - ios_.data());
+            io.cancel_requested_ = true;
             io.cancel_pending_ = true;
             cancels_[index].clb_ = clb;
             cancels_[index].ctx_ = ctx;
