@@ -34,7 +34,13 @@
 #include "absl/log/log_sink.h"
 #include "absl/log/log_entry.h"
 
-#ifdef HAVE_CUDA
+// Avoid passing HAVE_CUDA to nvcc: UCX uses that macro for its own build features.
+// CUDA translation units identify themselves through __CUDACC__.
+#if defined(HAVE_CUDA) || defined(__CUDACC__)
+#define NIXL_TEST_HAVE_CUDA 1
+#endif
+
+#ifdef NIXL_TEST_HAVE_CUDA
 #include <cuda_runtime.h>
 #endif
 
@@ -42,7 +48,7 @@ namespace gtest {
 
 inline bool
 hasCudaGpu() {
-#ifdef HAVE_CUDA
+#ifdef NIXL_TEST_HAVE_CUDA
     int count = 0;
     auto err = cudaGetDeviceCount(&count);
     return (err == cudaSuccess && count > 0);
