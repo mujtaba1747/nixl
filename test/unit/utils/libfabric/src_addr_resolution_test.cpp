@@ -235,11 +235,12 @@ testSparseAndHighAgentIndex(nixlLibfabricRailManager &mgr) {
 }
 
 static int
-testRemapAndRemove(nixlLibfabricRailManager &mgr) {
+testRemapAndRemove() {
     NIXL_INFO << "  testRemapAndRemove";
     mock_av_reset();
 
-    const nixlLibfabricRail &rail = mgr.getRail(3);
+    // A rail of its own, so references left by earlier tests cannot keep an entry alive.
+    const nixlLibfabricRail rail("efa_0", "efa", 0, FI_HMEM_SYSTEM);
     const auto eps = makeEndpoints("agentC", 1);
 
     fi_addr_t first = FI_ADDR_UNSPEC;
@@ -251,12 +252,67 @@ testRemapAndRemove(nixlLibfabricRailManager &mgr) {
     TEST_ASSERT(rail.insertAddress(eps[0].data(), 12, &second) == NIXL_SUCCESS, "re-insert ok");
     TEST_ASSERT(first == second, "duplicate insert returns the same fi_addr");
     TEST_ASSERT(rail.resolveSourceAddress(first) == 12u, "re-map takes the new agent index");
+    TEST_ASSERT(rail.getAddressCount() == 1, "a shared entry is one AV address");
 
-    // Removing the address must drop the mapping, otherwise a later completion whose
-    // fi_addr the provider recycles would be credited to the departed agent.
-    TEST_ASSERT(rail.removeAddress(first) == NIXL_SUCCESS, "removeAddress ok");
+    // The old connection letting go must not take the entry, or the mapping, from the new one.
+    TEST_ASSERT(rail.removeAddress(first) == NIXL_SUCCESS, "first removeAddress ok");
+    TEST_ASSERT(av_removed_stub.empty(), "entry still referenced is not removed from the AV");
+    TEST_ASSERT(rail.resolveSourceAddress(first) == 12u, "the live connection keeps its mapping");
+
+    // The last reference removes the entry and drops the mapping, otherwise a later
+    // completion whose fi_addr the provider recycles would be credited to the departed agent.
+    TEST_ASSERT(rail.removeAddress(first) == NIXL_SUCCESS, "last removeAddress ok");
+    TEST_ASSERT(av_removed_stub.size() == 1 && av_removed_stub[0] == first,
+                "last reference removes the entry from the AV");
     TEST_ASSERT(rail.resolveSourceAddress(first) == nixlLibfabricRail::kUnknownAgentIdx,
-                "mapping cleared after removeAddress");
+                "mapping cleared after the last removeAddress");
+    TEST_ASSERT(rail.getAddressCount() == 0, "AV is empty");
+
+    // A remove with no reference left is refused rather than passed to the provider.
+    TEST_ASSERT(rail.removeAddress(first) == NIXL_ERR_NOT_FOUND, "over-release is refused");
+    TEST_ASSERT(av_removed_stub.size() == 1, "over-release does not reach fi_av_remove");
+
+    return 0;
+}
+
+static int
+testInsertAllAddressesRollback() {
+    NIXL_INFO << "  testInsertAllAddressesRollback";
+    mock_av_reset();
+
+    nixlLibfabricRailManager mgr(0);
+    const size_t num_rails = mgr.getNumRails();
+    const auto eps = makeEndpoints("peerR", num_rails);
+
+    // Fail partway through the second local rail, as EFA does once it runs out of address
+    // handles: everything inserted before the failure must come out again.
+    const long succeed = static_cast<long>(num_rails + 1);
+    av_insert_budget_stub = succeed;
+
+    std::unordered_map<size_t, std::vector<fi_addr_t>> fi_addrs;
+    std::vector<char *> ep_names;
+    nixl_status_t st = mgr.insertAllAddresses(eps, 77, fi_addrs, ep_names);
+    TEST_ASSERT(st == NIXL_ERR_BACKEND, "insertAllAddresses reports the failed insert");
+    TEST_ASSERT(fi_addrs.empty() && ep_names.empty(), "outputs are empty after a failure");
+    TEST_ASSERT(av_removed_stub.size() == static_cast<size_t>(succeed),
+                "every successful insert was rolled back");
+    for (size_t rail_id = 0; rail_id < num_rails; ++rail_id) {
+        TEST_ASSERT(mgr.getRail(rail_id).getAddressCount() == 0,
+                    "no AV entry left behind on rail " + std::to_string(rail_id));
+    }
+
+    // With room again, the retry succeeds and its release empties every AV.
+    av_insert_budget_stub = -1;
+    av_removed_stub.clear();
+    st = mgr.insertAllAddresses(eps, 77, fi_addrs, ep_names);
+    TEST_ASSERT(st == NIXL_SUCCESS, "retry after rollback succeeds");
+    TEST_ASSERT(mgr.removeAllAddresses(fi_addrs) == NIXL_SUCCESS, "removeAllAddresses ok");
+    TEST_ASSERT(av_removed_stub.size() == num_rails * num_rails,
+                "every endpoint removed from every rail");
+    for (size_t rail_id = 0; rail_id < num_rails; ++rail_id) {
+        TEST_ASSERT(mgr.getRail(rail_id).getAddressCount() == 0,
+                    "rail " + std::to_string(rail_id) + " AV is empty after release");
+    }
 
     return 0;
 }
@@ -489,7 +545,10 @@ main() {
     if ((res = testSparseAndHighAgentIndex(mgr)) != 0) {
         return res;
     }
-    if ((res = testRemapAndRemove(mgr)) != 0) {
+    if ((res = testRemapAndRemove()) != 0) {
+        return res;
+    }
+    if ((res = testInsertAllAddressesRollback()) != 0) {
         return res;
     }
     if ((res = testInsertAllAddressesCrossProduct(mgr)) != 0) {

@@ -132,6 +132,9 @@ public:
     uint16_t post_xfer_id;
     const nixl_xfer_op_t operation_;
     const std::string remote_agent_;
+    // Keeps the peer's AV entries alive while this transfer's requests may still be posted or
+    // in flight: set by postXfer(), dropped by checkXfer() once all of them completed.
+    std::shared_ptr<nixlLibfabricConnection> conn_;
     bool has_notif;
     uint32_t total_notif_msg_len; // Total length of notification message across all fragments
 
@@ -196,6 +199,11 @@ private:
 
     // Rail Manager - Stack allocated for better performance (mutable for const methods)
     mutable nixlLibfabricRailManager rail_manager_;
+
+    // Handed (weakly) to every connection that owns AV entries in rail_manager_, and reset by
+    // cleanup() so connections released after teardown leave the closing AVs alone.
+    std::shared_ptr<nixlLibfabricRailManager *> av_owner_token_ =
+        std::make_shared<nixlLibfabricRailManager *>(&rail_manager_);
 
     // Configurable striping threshold
     size_t striping_threshold_;
@@ -350,7 +358,7 @@ private:
     // a reply to a peer's fresh (has_conn) handshake. If the peer may not have seen us
     // (i.e. never sent us a handshake), embed our own connection info in the message.
     nixl_status_t
-    sendHandshakeTo(const nixlLibfabricConnection &conn) const;
+    sendHandshakeTo(const std::shared_ptr<nixlLibfabricConnection> &conn) const;
 
     // Records that a peer has us in its address vectors, so we may start sending to it.
     // Will load the peer's connection info from the handshake payload, if it's a new peer.
@@ -372,6 +380,11 @@ private:
                        nixlBackendMD *&output);
     void
     initPostThreadPool();
+    // Unregisters conn if it is still the one registered for its agent, and drops its queued
+    // handshake reply. Its AV entries go with the last reference (see releaseAddresses()).
+    // Returns the removed reference so the caller can drop it outside any lock.
+    std::shared_ptr<nixlLibfabricConnection>
+    retireConnection(const std::shared_ptr<nixlLibfabricConnection> &conn);
     nixl_status_t
     postXferDescriptors(nixlLibfabricReq::OpType op_type,
                         const nixl_meta_dlist_t &local,

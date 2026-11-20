@@ -92,6 +92,9 @@ RequestPool::release(nixlLibfabricReq *req) const {
         return;
     }
 
+    // Destroyed after pool_mutex_ is released: a callback may hold the last reference to a
+    // connection, whose destructor removes AV entries and takes the rail's AV and EP locks.
+    std::function<void(nixl_status_t)> callback;
     std::lock_guard<std::mutex> lock(pool_mutex_);
 
     // GUARD: Check if already released
@@ -108,6 +111,7 @@ RequestPool::release(nixlLibfabricReq *req) const {
     req->xfer_id = 0;
     req->chunk_offset = 0;
     req->chunk_size = 0;
+    callback = std::move(req->completion_callback);
     req->completion_callback = nullptr;
     memset(&req->ctx, 0, sizeof(fi_context));
 
@@ -1969,15 +1973,18 @@ nixlLibfabricRail::insertAddress(const void *addr,
         return NIXL_ERR_BACKEND;
     }
 
+    const std::lock_guard<std::mutex> av_lock(av_mutex_);
     int ret;
     {
         const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
         ret = fi_av_insert(av, addr, 1, fi_addr_out, 0, NULL);
     }
     if (ret != 1) {
-        NIXL_ERROR << "fi_av_insert failed on rail " << rail_id << ": " << fi_strerror(-ret);
+        NIXL_ERROR << "fi_av_insert failed on rail " << rail_id << ": " << fi_strerror(-ret)
+                   << " (" << av_refcount_.size() << " addresses already in this AV)";
         return NIXL_ERR_BACKEND;
     }
+    ++av_refcount_[*fi_addr_out];
 
     // Kept together with the insert so the table cannot drift from the AV.
     mapSourceAddress(*fi_addr_out, agent_idx);
@@ -1996,18 +2003,30 @@ nixlLibfabricRail::removeAddress(fi_addr_t fi_addr) const {
         return NIXL_ERR_BACKEND;
     }
 
+    const std::lock_guard<std::mutex> av_lock(av_mutex_);
+    auto ref_it = av_refcount_.find(fi_addr);
+    if (ref_it == av_refcount_.end()) {
+        NIXL_ERROR << "removeAddress: fi_addr " << fi_addr << " is not in the AV of rail "
+                   << rail_id;
+        return NIXL_ERR_NOT_FOUND;
+    }
+    if (--ref_it->second > 0) {
+        // Still held by another connection to the same endpoint, whose mapping is the current
+        // one (the later insert re-mapped it), so leave both the entry and the mapping alone.
+        NIXL_DEBUG << "fi_addr " << fi_addr << " on rail " << rail_id << " still has "
+                   << ref_it->second << " reference(s); keeping it in the AV";
+        return NIXL_SUCCESS;
+    }
+    av_refcount_.erase(ref_it);
+
     int ret;
     {
         const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
         ret = fi_av_remove(av, &fi_addr, 1, 0);
     }
-    if (ret != 0) {
-        NIXL_ERROR << "fi_av_remove failed on rail " << rail_id << ": " << fi_strerror(-ret);
-        return NIXL_ERR_BACKEND;
-    }
 
-    // Clear the mapping so a reused fi_addr is not misattributed to a different peer.
-    // Not reachable yet: cleanupConnection() has no callers; disconnect() never removes AV entries.
+    // Clear the mapping even if the remove failed: no connection owns this fi_addr any more,
+    // and a reused fi_addr must not be misattributed to the departed peer.
     {
         std::unique_lock<std::shared_mutex> lk(src_addr_mutex_);
         if (fi_addr < src_addr_to_agent_.size()) {
@@ -2015,7 +2034,19 @@ nixlLibfabricRail::removeAddress(fi_addr_t fi_addr) const {
         }
     }
 
+    if (ret != 0) {
+        NIXL_ERROR << "fi_av_remove failed on rail " << rail_id << " for fi_addr " << fi_addr
+                   << ": " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
     return NIXL_SUCCESS;
+}
+
+size_t
+nixlLibfabricRail::getAddressCount() const {
+    const std::lock_guard<std::mutex> av_lock(av_mutex_);
+    return av_refcount_.size();
 }
 
 void

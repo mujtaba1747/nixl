@@ -69,12 +69,19 @@ static struct fi_ops fi_av_fid_ops_stub{
 // repeated insert of the same bytes.
 static std::map<std::string, fi_addr_t> av_inserted_stub;
 static fi_addr_t av_next_fi_addr_stub = 0;
+// Inserts left before fi_av_insert() fails with -FI_ENOMEM, like EFA out of address handles.
+// Negative means unlimited.
+static long av_insert_budget_stub = -1;
+// Every fi_addr passed to fi_av_remove(), in order.
+static std::vector<fi_addr_t> av_removed_stub;
 
 // Unused by the other test that shares this header.
 [[maybe_unused]] static void
 mock_av_reset() {
     av_inserted_stub.clear();
     av_next_fi_addr_stub = 0;
+    av_insert_budget_stub = -1;
+    av_removed_stub.clear();
 }
 
 static int
@@ -84,6 +91,12 @@ fi_av_insert_stub(struct fid_av *av,
                   fi_addr_t *fi_addr,
                   uint64_t flags,
                   void *context) {
+    if (av_insert_budget_stub == 0) {
+        return -FI_ENOMEM;
+    }
+    if (av_insert_budget_stub > 0) {
+        --av_insert_budget_stub;
+    }
     for (size_t i = 0; i < count; ++i) {
         // Endpoint names are fixed-length opaque blobs; key on their bytes.
         const std::string key(static_cast<const char *>(addr) + i * LF_EP_NAME_MAX_LEN,
@@ -99,6 +112,7 @@ fi_av_insert_stub(struct fid_av *av,
 
 static int
 fi_av_remove_stub(struct fid_av *av, fi_addr_t *fi_addr, size_t count, uint64_t flags) {
+    av_removed_stub.insert(av_removed_stub.end(), fi_addr, fi_addr + count);
     return 0;
 }
 

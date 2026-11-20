@@ -28,6 +28,7 @@
 #include <shared_mutex>
 #include <atomic>
 #include <thread>
+#include <unordered_map>
 #include <ostream>
 #include <stack>
 
@@ -458,13 +459,21 @@ public:
     static constexpr uint32_t kUnknownAgentIdx = std::numeric_limits<uint32_t>::max();
 
     // Address vector management methods
-    /** Insert remote endpoint address into address vector, and map it to agent_idx */
+    /** Insert remote endpoint address into address vector, and map it to agent_idx.
+     *  Each successful insert takes one reference on the returned fi_addr, to be dropped by
+     *  exactly one removeAddress(). */
     nixl_status_t
     insertAddress(const void *addr, uint32_t agent_idx, fi_addr_t *fi_addr_out) const;
 
-    /** Remove address from address vector, and drop its source-address mapping */
+    /** Drop one reference taken by insertAddress(). The last reference removes the address
+     *  from the address vector, which releases its provider resources (an EFA address handle),
+     *  and drops its source-address mapping. */
     nixl_status_t
     removeAddress(fi_addr_t fi_addr) const;
+
+    /** Number of distinct addresses this rail holds in its address vector. */
+    [[nodiscard]] size_t
+    getAddressCount() const;
 
     /** Resolve a fi_cq_readfrom() source address to a local agent index. Returns
      *  kUnknownAgentIdx if it is FI_ADDR_NOTAVAIL or unmapped; callers must then drop it. */
@@ -687,6 +696,15 @@ private:
     // FI_AV_TABLE). Written at connection setup, read on the completion path.
     mutable std::vector<uint32_t> src_addr_to_agent_;
     mutable std::shared_mutex src_addr_mutex_;
+
+    // References on each fi_addr in the AV. A provider may hand back the existing fi_addr for a
+    // repeated insert of the same address (EFA does, without counting it), so a reconnect whose
+    // previous connection is still draining shares the entry; only the last reference removes
+    // it. av_mutex_ makes the refcount and the fi_av_insert()/fi_av_remove() it guards one
+    // step, so a remove cannot drop an entry a concurrent insert has just been handed. It is
+    // taken before ep_mutex_, which stays innermost.
+    mutable std::mutex av_mutex_;
+    mutable std::unordered_map<fi_addr_t, size_t> av_refcount_;
 
     // Separate request pools for optimal performance
     ControlRequestPool control_request_pool_;

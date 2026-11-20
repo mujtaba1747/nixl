@@ -17,12 +17,43 @@
  */
 #include "libfabric_connection.h"
 #include "common/nixl_log.h"
+#include "libfabric/libfabric_rail_manager.h"
 
 nixlLibfabricConnection::nixlLibfabricConnection(const std::string &remote_agent,
                                                  size_t agent_index)
     : agent_index_(agent_index),
       remoteAgent_(remote_agent),
       overall_state_(ConnectionState::DISCONNECTED) {}
+
+nixlLibfabricConnection::~nixlLibfabricConnection() {
+    releaseAddresses();
+}
+
+void
+nixlLibfabricConnection::adoptAddresses(std::weak_ptr<nixlLibfabricRailManager *> av_owner) {
+    av_owner_ = std::move(av_owner);
+}
+
+void
+nixlLibfabricConnection::releaseAddresses() {
+    const std::shared_ptr<nixlLibfabricRailManager *> owner = av_owner_.lock();
+    av_owner_.reset();
+    if (!owner || !*owner) {
+        return;
+    }
+
+    size_t count = 0;
+    for (const auto &[rail_id, addrs] : rail_remote_addr_list_) {
+        count += addrs.size();
+    }
+    const nixl_status_t status = (*owner)->removeAllAddresses(rail_remote_addr_list_);
+    if (status != NIXL_SUCCESS) {
+        NIXL_WARN << "Releasing the " << count << " AV entries of agent " << remoteAgent_
+                  << " failed partway with status " << status;
+        return;
+    }
+    NIXL_INFO << "Released the " << count << " AV entries of agent " << remoteAgent_;
+}
 
 nixl_status_t
 nixlLibfabricConnection::establish() {
@@ -52,8 +83,8 @@ nixlLibfabricConnection::disconnect() {
         return NIXL_SUCCESS;
     }
 
-    // TODO: Implement disconnect logic to cleanup the AV Address Entries from both local and remote
-    // AV.
+    // The AV entries are released with the last reference to this connection, once nothing in
+    // flight can still use them (see releaseAddresses()).
     overall_state_.store(ConnectionState::DISCONNECTED, std::memory_order_release);
     NIXL_INFO << "Disconnected from agent: " << remoteAgent_;
     return NIXL_SUCCESS;

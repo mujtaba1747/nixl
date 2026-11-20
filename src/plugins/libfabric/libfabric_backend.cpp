@@ -763,10 +763,14 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
     }
 
     if (conn_for_handshake) {
-        nixl_status_t hs = sendHandshakeTo(*conn_for_handshake);
+        nixl_status_t hs = sendHandshakeTo(conn_for_handshake);
         if (hs != NIXL_SUCCESS) {
+            // The caller sees a failed load and never disconnects this peer, so unregister it
+            // here; otherwise its AV entries would stay for the life of the engine and a retry
+            // would find the stale registration and skip the handshake.
             NIXL_ERROR << "Handshake send to '" << remote_agent << "' failed with status " << hs
-                       << "; their first transfers to us will land in the pre-handshake bucket";
+                       << "; dropping the connection so a retry starts fresh";
+            retireConnection(conn_for_handshake);
             return hs;
         }
     }
@@ -806,24 +810,49 @@ nixlLibfabricEngine::connect(const std::string &remote_agent) {
 
 nixl_status_t
 nixlLibfabricEngine::disconnect(const std::string &remote_agent) {
-    std::lock_guard<std::mutex> lock(connection_state_mutex_);
-    auto it = connections_.find(remote_agent);
-    if (it == connections_.end()) {
-        NIXL_WARN << "Disconnect failed. No metadata connection info for " << remote_agent;
-        return NIXL_ERR_NOT_FOUND;
+    std::shared_ptr<nixlLibfabricConnection> conn;
+    {
+        std::lock_guard<std::mutex> lock(connection_state_mutex_);
+        auto it = connections_.find(remote_agent);
+        if (it == connections_.end()) {
+            NIXL_WARN << "Disconnect failed. No metadata connection info for " << remote_agent;
+            return NIXL_ERR_NOT_FOUND;
+        }
+        conn = it->second;
     }
 
-    nixl_status_t status = it->second->disconnect();
-    connections_.erase(it);
-    // Drop queued replies for this peer so teardown never posts toward it from the CM thread.
+    nixl_status_t status = conn->disconnect();
+    retireConnection(conn);
+
+    if (conn.use_count() > 1) {
+        NIXL_INFO << "Disconnected from " << remote_agent << "; its AV entries are released once "
+                  << "the remaining " << (conn.use_count() - 1)
+                  << " user(s) (loaded remote memory, transfers in flight) let go";
+    }
+    // Usually the last reference: releases the AV entries here, outside the engine's locks.
+    return status;
+}
+
+std::shared_ptr<nixlLibfabricConnection>
+nixlLibfabricEngine::retireConnection(const std::shared_ptr<nixlLibfabricConnection> &conn) {
+    std::shared_ptr<nixlLibfabricConnection> removed;
+    {
+        std::lock_guard<std::mutex> lock(connection_state_mutex_);
+        auto it = connections_.find(conn->remoteAgent_);
+        if (it != connections_.end() && it->second == conn) {
+            removed = std::move(it->second);
+            connections_.erase(it);
+        }
+    }
+    // Drop a queued reply so the CM thread never posts toward the retired peer.
     {
         const std::lock_guard<std::mutex> cm_lock(cm_mutex_);
         std::erase_if(pending_replies_,
-                      [&remote_agent](const std::shared_ptr<nixlLibfabricConnection> &pending) {
-                          return pending->remoteAgent_ == remote_agent;
+                      [&conn](const std::shared_ptr<nixlLibfabricConnection> &pending) {
+                          return pending == conn;
                       });
     }
-    return status;
+    return removed;
 }
 
 nixl_status_t
@@ -871,9 +900,11 @@ nixlLibfabricEngine::createAgentConnection(
                                          conn->rail_remote_addr_list_,
                                          conn->src_ep_names_);
     if (data_status != NIXL_SUCCESS) {
+        // insertAllAddresses() already removed what it inserted.
         NIXL_ERROR << "insertAllAddresses failed for rails with status: " << data_status;
         return data_status;
     }
+    conn->adoptAddresses(av_owner_token_);
 
     for (size_t i = 0; i < agent_names_.size(); ++i) {
         NIXL_DEBUG << "Index " << i << ": " << agent_names_[i];
@@ -1519,6 +1550,10 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
     // Allocate xfer_id once in prepXfer
     backend_handle->post_xfer_id = LibfabricUtils::getNextXferId();
 
+    // Hold the peer's AV entries until every request this post submits has completed, even if
+    // the peer is disconnected meanwhile.
+    backend_handle->conn_ = conn;
+
     nixlLibfabricReq::OpType op_type;
     int desc_count = local.descCount();
 
@@ -1721,6 +1756,10 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
 
     // Then check for completions after processing any pending completions
     if (backend_handle->is_completed()) {
+        // Nothing of this transfer is left on the wire, so stop pinning the peer's AV entries.
+        // Notifications below look the connection up by name and pin it themselves.
+        backend_handle->conn_.reset();
+
         // Check if any request completed with error
         nixl_status_t err = backend_handle->get_error_status();
         if (err != NIXL_SUCCESS) {
@@ -1909,10 +1948,13 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
                    << " payload_chunk_size=" << header.payload_length << "B"
                    << " notif_xfer_id=" << header.notif_xfer_id;
 
+        // The send may sit in the post queue or in flight after a disconnect; the callback
+        // keeps the peer's AV entry alive until it completes.
         nixl_status_t status = rail_manager_.postControlMessage(
             nixlLibfabricRailManager::ControlMessageType::NOTIFICATION,
             control_request,
-            connection->rail_remote_addr_list_[rail_id][0]);
+            connection->rail_remote_addr_list_[rail_id][0],
+            [connection](nixl_status_t) {});
 
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "postControlMessage failed on rail " << rail_id << " for fragment "
@@ -1970,8 +2012,10 @@ nixlLibfabricEngine::notifXferErrorPriv(const std::string &remote_agent,
     // and nothing else reports it. This runs later on the progress thread, by which time the
     // caller's backend handle may already have been released, so capture values only and never
     // touch the handle.
+    // Holding the connection keeps the peer's AV entry alive until the send completes.
     auto send_completion = [agent = remote_agent,
-                            xfer_id = notif_xfer_id](nixl_status_t send_status) {
+                            xfer_id = notif_xfer_id,
+                            connection](nixl_status_t send_status) {
         if (send_status == NIXL_SUCCESS) {
             return;
         }
@@ -2346,6 +2390,9 @@ void
 nixlLibfabricEngine::cleanup() {
     NIXL_DEBUG << "Cleaning up all resources";
     post_thread_pool_.reset();
+    // The rails close their AVs, which frees every entry; connections released from here on
+    // must not remove theirs from rails that are being torn down.
+    av_owner_token_.reset();
 #ifdef HAVE_CUDA
     // Cleanup CUDA context
     vramFiniCtx();

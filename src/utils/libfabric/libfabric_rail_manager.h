@@ -189,19 +189,22 @@ public:
      * @param fi_addrs_out Libfabric address handles for inserted endpoints,
      *                     indexed by local rail id.
      * @param ep_names_out Local endpoint names for reference
-     * @return NIXL_SUCCESS on success, error code on failure
+     * @return NIXL_SUCCESS on success, error code on failure. On failure every address this
+     *         call inserted has been removed again and both outputs are empty.
      */
     nixl_status_t
     insertAllAddresses(const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,
                        uint32_t agent_idx,
                        std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs_out,
                        std::vector<char *> &ep_names_out);
-    /** Clean up connection resources for rails
-     * @param fi_addrs_to_remove Libfabric addresses to remove
-     * @return NIXL_SUCCESS on success, error code on failure
+    /** Drop the AV references taken by insertAllAddresses(), on every rail
+     * @param fi_addrs Libfabric addresses to remove, indexed by local rail id, as returned in
+     *                 fi_addrs_out by insertAllAddresses(). FI_ADDR_UNSPEC entries are skipped.
+     * @return NIXL_SUCCESS if every address was removed, else the last error; removal carries
+     *         on past failures.
      */
     nixl_status_t
-    cleanupConnection(const std::vector<fi_addr_t> &fi_addrs_to_remove);
+    removeAllAddresses(const std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs);
 
     /** Single-pass transfer preparation and submission with automatic striping/round-robin
      * @param op_type Operation type (WRITE or READ)

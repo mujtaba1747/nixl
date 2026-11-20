@@ -41,7 +41,9 @@
 // Sized to fit inside one libfabric control buffer
 // (NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE = 8 KiB).
 nixl_status_t
-nixlLibfabricEngine::sendHandshakeTo(const nixlLibfabricConnection &conn) const {
+nixlLibfabricEngine::sendHandshakeTo(
+    const std::shared_ptr<nixlLibfabricConnection> &conn_ptr) const {
+    const nixlLibfabricConnection &conn = *conn_ptr;
     const uint16_t proto_ver = static_cast<uint16_t>(NIXL_LIBFABRIC_PROTO_VERSION);
     const std::string &my_name = localAgent;
 
@@ -94,8 +96,11 @@ nixlLibfabricEngine::sendHandshakeTo(const nixlLibfabricConnection &conn) const 
     NIXL_DEBUG << "Sending handshake to '" << conn.remoteAgent_ << "' proto_ver=" << proto_ver
                << " (my agent_name='" << my_name
                << "', piggybacked_conn_info_len=" << piggybacked_conn_info.size() << ")";
-    return rail_manager_.postControlMessage(
-        nixlLibfabricRailManager::ControlMessageType::HANDSHAKE, req, rail_it->second[0]);
+    // The callback keeps the peer's AV entry alive until the send completes.
+    return rail_manager_.postControlMessage(nixlLibfabricRailManager::ControlMessageType::HANDSHAKE,
+                                            req,
+                                            rail_it->second[0],
+                                            [conn_ptr](nixl_status_t) {});
 }
 
 void
@@ -248,7 +253,7 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
                 // thread that can make progress. Hand the reply to the CM thread.
                 queueHandshakeReply(conn);
             } else {
-                nixl_status_t status = sendHandshakeTo(*conn);
+                nixl_status_t status = sendHandshakeTo(conn);
                 if (status != NIXL_SUCCESS) {
                     NIXL_WARN << "Replying to re-establishment handshake from '" << peer_agent_name
                               << "' failed (non-fatal; re-triggers on the peer's next re-add): "
@@ -304,7 +309,7 @@ nixlLibfabricEngine::cmThread() {
                 continue;
             }
         }
-        nixl_status_t status = sendHandshakeTo(*conn);
+        nixl_status_t status = sendHandshakeTo(conn);
         if (status != NIXL_SUCCESS) {
             NIXL_WARN << "Replying to re-establishment handshake from '" << conn->remoteAgent_
                       << "' failed (non-fatal; re-triggers on the peer's next re-add): status="

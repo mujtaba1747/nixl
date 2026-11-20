@@ -1053,7 +1053,14 @@ nixlLibfabricRailManager::insertAllAddresses(
             nixl_status_t status =
                 rails[rail_id]->insertAddress(endpoint.data(), agent_idx, &fi_addr);
             if (status != NIXL_SUCCESS) {
-                NIXL_ERROR << "Failed for rail " << rail_id;
+                NIXL_ERROR << "Failed to insert remote endpoint " << fi_addrs_out[rail_id].size()
+                           << " of " << endpoints.size() << " into the AV of rail " << rail_id
+                           << "; rolling back the addresses already inserted for this peer";
+                // Every insert holds an AV entry (an EFA address handle); a failed setup must
+                // not keep the ones that succeeded, or each retry leaks more of them.
+                removeAllAddresses(fi_addrs_out);
+                fi_addrs_out.clear();
+                ep_names_out.clear();
                 return status;
             }
             fi_addrs_out[rail_id].push_back(fi_addr);
@@ -1070,34 +1077,33 @@ nixlLibfabricRailManager::insertAllAddresses(
 }
 
 nixl_status_t
-nixlLibfabricRailManager::cleanupConnection(const std::vector<fi_addr_t> &fi_addrs_to_remove) {
-    auto &rails = rails_;
-
-    if (fi_addrs_to_remove.size() != rails.size()) {
-        NIXL_ERROR << "Expected " << rails.size() << " fi_addrs, got " << fi_addrs_to_remove.size();
-        return NIXL_ERR_INVALID_PARAM;
-    }
-
-    NIXL_DEBUG << "Cleaning up connection for " << rails.size() << " rails";
-    // Remove addresses from all rails
+nixlLibfabricRailManager::removeAllAddresses(
+    const std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs) {
     nixl_status_t overall_status = NIXL_SUCCESS;
-    for (size_t rail_id = 0; rail_id < rails.size(); ++rail_id) {
-        if (fi_addrs_to_remove[rail_id] != FI_ADDR_UNSPEC) {
-            nixl_status_t status = rails[rail_id]->removeAddress(fi_addrs_to_remove[rail_id]);
-            if (status != NIXL_SUCCESS) {
-                NIXL_ERROR << "Failed to remove address from rail " << rail_id
-                           << ", fi_addr=" << fi_addrs_to_remove[rail_id];
-                overall_status = status;
-                // Continue cleanup for other rails even if one fails
-            } else {
-                NIXL_DEBUG << "Successfully removed address from rail " << rail_id
-                           << ", fi_addr=" << fi_addrs_to_remove[rail_id];
+    size_t removed = 0;
+    for (const auto &[rail_id, rail_addrs] : fi_addrs) {
+        if (rail_id >= rails_.size()) {
+            NIXL_ERROR << "removeAllAddresses: rail " << rail_id << " out of range ("
+                       << rails_.size() << " rails)";
+            overall_status = NIXL_ERR_INVALID_PARAM;
+            continue;
+        }
+        for (fi_addr_t fi_addr : rail_addrs) {
+            if (fi_addr == FI_ADDR_UNSPEC) {
+                continue;
             }
-        } else {
-            NIXL_DEBUG << "Skipping FI_ADDR_UNSPEC for rail " << rail_id;
+            // Keep going on failure, so one bad entry does not strand the rest.
+            nixl_status_t status = rails_[rail_id]->removeAddress(fi_addr);
+            if (status != NIXL_SUCCESS) {
+                NIXL_ERROR << "Failed to remove fi_addr " << fi_addr << " from rail " << rail_id;
+                overall_status = status;
+            } else {
+                ++removed;
+            }
         }
     }
-    NIXL_DEBUG << "Completed cleanup for " << rails.size() << " rails";
+    NIXL_DEBUG << "Released " << removed << " AV references across " << fi_addrs.size()
+               << " rails";
     return overall_status;
 }
 
