@@ -30,8 +30,10 @@ nixlLibfabricConnection::~nixlLibfabricConnection() {
 }
 
 void
-nixlLibfabricConnection::adoptAddresses(std::weak_ptr<nixlLibfabricRailManager *> av_owner) {
+nixlLibfabricConnection::adoptAddresses(std::weak_ptr<nixlLibfabricRailManager *> av_owner,
+                                        std::weak_ptr<nixlLibfabricReleaseHook> release_hook) {
     av_owner_ = std::move(av_owner);
+    release_hook_ = std::move(release_hook);
 }
 
 void
@@ -40,6 +42,11 @@ nixlLibfabricConnection::releaseAddresses() {
     av_owner_.reset();
     if (!owner || !*owner) {
         return;
+    }
+    const std::shared_ptr<nixlLibfabricReleaseHook> hook = release_hook_.lock();
+    release_hook_.reset();
+    if (hook && *hook && (*hook)(*this)) {
+        return; // the engine closes the connection with the peer, then removes the entries
     }
 
     size_t count = 0;

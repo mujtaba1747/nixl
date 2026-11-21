@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -30,6 +31,11 @@
 #include <memory>
 
 class nixlLibfabricRailManager;
+struct nixlLibfabricConnection;
+
+/** Decides what happens to a released connection's AV entries. Returns true if it took
+ *  ownership of them (moved out rail_remote_addr_list_), false to have them removed now. */
+using nixlLibfabricReleaseHook = std::function<bool(nixlLibfabricConnection &)>;
 
 /** Multi-rail connection metadata for remote agents */
 struct nixlLibfabricConnection : public nixlBackendConnMD {
@@ -45,7 +51,8 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
     /** Take ownership of the AV entries in rail_remote_addr_list_, inserted by
      *  nixlLibfabricRailManager::insertAllAddresses(). */
     void
-    adoptAddresses(std::weak_ptr<nixlLibfabricRailManager *> av_owner);
+    adoptAddresses(std::weak_ptr<nixlLibfabricRailManager *> av_owner,
+                   std::weak_ptr<nixlLibfabricReleaseHook> release_hook = {});
 
     /** Drop this connection's references on its AV entries, releasing the EFA address
      *  handles they hold. Runs from the destructor: the connection is shared by every user of
@@ -75,6 +82,16 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
     // at teardown, so a connection that outlives the rails (held by a callback in a request
     // pool, say) leaves the AVs to be closed with them instead of touching freed rails.
     std::weak_ptr<nixlLibfabricRailManager *> av_owner_;
+    // Lets the engine run the close exchange with the peer before the entries go (see
+    // libfabric_close.cpp). Expired with av_owner_ at teardown.
+    std::weak_ptr<nixlLibfabricReleaseHook> release_hook_;
+
+    // Set when this side's NIXL core loaded the peer's connection info (as opposed to a
+    // connection created only from the peer's handshake). The core then decides when the
+    // connection goes, so a peer's CLOSE is answered with "kept".
+    std::atomic<bool> core_loaded_{false};
+    // Set when the peer asked us to close: on release we answer its CLOSE instead of sending one.
+    std::atomic<bool> peer_closed_{false};
 
     // Set once the peer holds our endpoints in its AV, so it can attribute our traffic.
     // establishConnection() blocks on handshake_cv_ until this or handshake_rejected_ is set.

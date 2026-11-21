@@ -281,6 +281,8 @@ public:
         NOTIFICATION, ///< User notification message
         HANDSHAKE, ///< Peer-idx assignment (NIXL_LIBFABRIC_MSG_HANDSHAKE)
         XFER_ERROR, ///< Batch had unpostable writes (NIXL_LIBFABRIC_MSG_XFER_ERROR)
+        CLOSE, ///< Connection released; asks the peer to drop us (NIXL_LIBFABRIC_MSG_CLOSE)
+        CLOSE_ACK, ///< Answer to CLOSE (NIXL_LIBFABRIC_MSG_CLOSE_ACK)
     };
     /** Send control message via control rail
      * @param msg_type Type of control message

@@ -58,6 +58,13 @@
 // Handshake timeout (seconds) for waiting on peer's inbound handshake
 #define NIXL_LIBFABRIC_HANDSHAKE_TIMEOUT_S 60
 
+// Close exchange: how long a released connection waits for the peer's CLOSE_ACK before
+// keeping its AV entries, and how soon a peer may be re-added after its entries were removed
+// (gives the peer time to remove its own). Backend params close_timeout_ms and
+// reinsert_cooldown_ms.
+#define NIXL_LIBFABRIC_DEFAULT_CLOSE_TIMEOUT_MS 5000
+#define NIXL_LIBFABRIC_DEFAULT_REINSERT_COOLDOWN_MS 500
+
 // Handshake SerDes tag names
 constexpr const char *NIXL_HANDSHAKE_TAG_VER = "ver";
 // Sent by protocol-version-1 peers in place of "ver"; only read to recognise such a peer.
@@ -65,6 +72,10 @@ constexpr const char *NIXL_HANDSHAKE_TAG_V1_IDX = "idx";
 constexpr const char *NIXL_HANDSHAKE_TAG_NAME = "name";
 constexpr const char *NIXL_HANDSHAKE_TAG_HAS_CONN = "has_conn";
 constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
+
+// Close-exchange SerDes tag names
+constexpr const char *NIXL_CLOSE_TAG_NAME = "name";
+constexpr const char *NIXL_CLOSE_TAG_KEPT = "kept";
 
 // Wire-protocol version of the libfabric plugin, exchanged in the handshake. Bump it on any
 // incompatible imm_data or control-message change. 1: 8-bit agent index in imm_data (sends
@@ -101,6 +112,11 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 // to a peer's fresh handshake. Carries protocol version, sender name, and
 // optionally connection info. See libfabric_handshake.cpp for wire-format details.
 #define NIXL_LIBFABRIC_MSG_HANDSHAKE 8
+// Connection close exchange, sent on rail 0 when a connection to a peer is released (see
+// libfabric_close.cpp). A receiver that predates these types drops them as unknown, so the
+// sender never gets an answer and keeps its address-vector entries for that peer.
+#define NIXL_LIBFABRIC_MSG_CLOSE 3
+#define NIXL_LIBFABRIC_MSG_CLOSE_ACK 5
 
 // Single-operation immediate data extraction (no intermediate shifts)
 #define NIXL_GET_MSG_TYPE_FROM_IMM(data) ((data) & NIXL_MSG_TYPE_MASK)

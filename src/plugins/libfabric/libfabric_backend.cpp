@@ -561,6 +561,8 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
                 handleXferError(notif_xfer_id, sender_peer_idx, final_completions);
             });
 
+        initCloseExchange();
+
         // Set up XFER_ID tracking callbacks for all rails
         NIXL_DEBUG << "Setting up XFER_ID tracking callbacks for " << rail_manager_.getNumRails()
                    << " rails";
@@ -657,6 +659,10 @@ nixlLibfabricEngine::~nixlLibfabricEngine() {
     NIXL_DEBUG
         << "Destructor starting, stopping all threads FIRST to prevent timing report interruption";
 
+    // Tell every peer we are going, so it can drop its entries for us, while the progress and
+    // CM threads can still carry the exchange.
+    closeAllConnections();
+
     // Stop the CM thread first: an in-flight reply send may be waiting on the progress
     // thread to drain its completions, so the progress thread must stop after it.
     {
@@ -717,6 +723,17 @@ nixlLibfabricEngine::getConnInfo(std::string &str) const {
 nixl_status_t
 nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
                                         const std::string &remote_conn_info) {
+    if (remote_agent != localAgent) {
+        // A peer whose entries we are removing may only be re-added once it removed its own.
+        awaitClose(remote_agent);
+    }
+    return loadRemoteConnInfoImpl(remote_agent, remote_conn_info, true);
+}
+
+nixl_status_t
+nixlLibfabricEngine::loadRemoteConnInfoImpl(const std::string &remote_agent,
+                                            const std::string &remote_conn_info,
+                                            bool from_core) {
 
     NIXL_DEBUG << "Loading remote info for agent: " << remote_agent
                << ", info length=" << remote_conn_info.length() << ", info (hex): "
@@ -744,8 +761,12 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
     {
         std::lock_guard<std::mutex> lock(connection_state_mutex_);
 
-        bool already_exists = (connections_.find(remote_agent) != connections_.end());
-        if (already_exists) {
+        auto existing = connections_.find(remote_agent);
+        if (existing != connections_.end()) {
+            if (from_core) {
+                // Created by the peer's handshake; from now on our core decides when it goes.
+                existing->second->core_loaded_.store(true, std::memory_order_release);
+            }
             NIXL_INFO << "Connection for " << remote_agent
                       << " already exists, skipping duplicate loadRemoteConnInfo";
             return NIXL_SUCCESS;
@@ -759,6 +780,7 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
 
         if (remote_agent != localAgent) {
             conn_for_handshake = connections_[remote_agent];
+            conn_for_handshake->core_loaded_.store(from_core, std::memory_order_release);
         }
     }
 
@@ -844,7 +866,8 @@ nixlLibfabricEngine::retireConnection(const std::shared_ptr<nixlLibfabricConnect
             connections_.erase(it);
         }
     }
-    // Drop a queued reply so the CM thread never posts toward the retired peer.
+    // Drop a queued reply so the CM thread never posts toward the retired peer. The caller
+    // holds conn, so no reference goes under cm_mutex_ (a release queues CM work).
     {
         const std::lock_guard<std::mutex> cm_lock(cm_mutex_);
         std::erase_if(pending_replies_,
@@ -891,6 +914,9 @@ nixlLibfabricEngine::createAgentConnection(
 
     conn->rail_remote_addr_list_.reserve(rail_manager_.getNumRails());
 
+    // End a close exchange the peer has made moot, so the insert below starts afresh.
+    absorbClose(agent_name, true);
+
     // Process all rails in one operation
     // The AV insert must happen before sendHandshakeTo() further down the call chain:
     // the peer treats our handshake as proof that we can attribute its traffic.
@@ -904,7 +930,9 @@ nixlLibfabricEngine::createAgentConnection(
         NIXL_ERROR << "insertAllAddresses failed for rails with status: " << data_status;
         return data_status;
     }
-    conn->adoptAddresses(av_owner_token_);
+    conn->adoptAddresses(av_owner_token_, release_hook_);
+    // Entries both sides kept are now held by the new connection too; drop the parked ones.
+    absorbClose(agent_name, false);
 
     for (size_t i = 0; i < agent_names_.size(); ++i) {
         NIXL_DEBUG << "Index " << i << ": " << agent_names_[i];
@@ -2393,6 +2421,11 @@ nixlLibfabricEngine::cleanup() {
     // The rails close their AVs, which frees every entry; connections released from here on
     // must not remove theirs from rails that are being torn down.
     av_owner_token_.reset();
+    release_hook_.reset();
+    {
+        const std::lock_guard<std::mutex> lock(close_mutex_);
+        closing_.clear(); // freed with the AVs
+    }
 #ifdef HAVE_CUDA
     // Cleanup CUDA context
     vramFiniCtx();

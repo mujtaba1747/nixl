@@ -212,7 +212,7 @@ nixlLibfabricEngine::handleHandshake(const std::string &raw_payload) {
             return;
         } else {
             nixl_status_t load_status =
-                this->loadRemoteConnInfo(peer_agent_name, piggybacked_conn_info);
+                loadRemoteConnInfoImpl(peer_agent_name, piggybacked_conn_info, false);
             if (load_status != NIXL_SUCCESS) {
                 NIXL_ERROR << "Failed to loadRemoteConnInfo() received with handshake. "
                            << "peer agent: " << peer_agent_name
@@ -283,18 +283,50 @@ nixlLibfabricEngine::queueHandshakeReply(std::shared_ptr<nixlLibfabricConnection
 void
 nixlLibfabricEngine::cmThread() {
     while (true) {
+        // Park close exchanges past their deadline; without a progress thread, nothing else
+        // may progress the rails that carry the answers.
+        bool needs_progress = false;
+        const auto next_deadline = expireCloses(needs_progress);
+        const bool self_progress = needs_progress && !progress_thread_enabled_;
+        if (self_progress) {
+            nixl_status_t ps = rail_manager_.progressActiveRails(
+                nixlLibfabricRailManager::ProgressCudaDevice::SetAndRestore);
+            if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) {
+                NIXL_WARN << "Failed to progress rails for the close exchange: " << ps;
+            }
+        }
+
         std::shared_ptr<nixlLibfabricConnection> conn;
+        std::function<void()> task;
         {
             std::unique_lock<std::mutex> lock(cm_mutex_);
-            cm_cv_.wait(lock, [this]() { return cm_thread_stop_ || !pending_replies_.empty(); });
-            if (cm_thread_stop_) {
-                return; // pending replies are dropped: teardown makes them moot
+            auto ready = [this]() {
+                return cm_thread_stop_ || !pending_replies_.empty() || !cm_tasks_.empty();
+            };
+            if (self_progress) {
+                cm_cv_.wait_for(lock, std::chrono::milliseconds(1), ready);
+            } else if (next_deadline) {
+                cm_cv_.wait_until(lock, *next_deadline, ready);
+            } else {
+                cm_cv_.wait(lock, ready);
             }
-            conn = std::move(pending_replies_.front());
-            pending_replies_.pop_front();
+            if (cm_thread_stop_) {
+                return; // pending work is dropped: teardown makes it moot
+            }
+            if (!cm_tasks_.empty()) {
+                task = std::move(cm_tasks_.front());
+                cm_tasks_.pop_front();
+            } else if (!pending_replies_.empty()) {
+                conn = std::move(pending_replies_.front());
+                pending_replies_.pop_front();
+            }
         }
-        if (cm_thread_stop_) {
-            continue; // teardown started: drop the popped reply
+        if (task) {
+            task();
+            continue;
+        }
+        if (!conn || cm_thread_stop_) {
+            continue; // woke for a deadline, or teardown started
         }
         // DISCONNECTED is also the pre-connect state of a live registration, so the
         // state cannot decide this: only a registration that is gone (disconnect()

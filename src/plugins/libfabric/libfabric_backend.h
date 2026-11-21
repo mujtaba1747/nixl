@@ -29,6 +29,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
+#include <functional>
+#include <optional>
 
 #include "nixl.h"
 #include "backend/backend_engine.h"
@@ -227,7 +229,40 @@ private:
     std::thread cm_thread_;
     std::condition_variable cm_cv_;
     std::deque<std::shared_ptr<nixlLibfabricConnection>> pending_replies_;
+    // Close-exchange sends, queued from any thread (see libfabric_close.cpp).
+    std::deque<std::function<void()>> cm_tasks_;
     std::atomic<bool> cm_thread_stop_{false};
+
+    // ---- Connection close exchange (libfabric_close.cpp) ----
+    // The AV entries of a released connection, from the moment it is released until both
+    // sides agree on removing them. EFA numbers the messages of each pair of endpoints; if
+    // only one side removed its entry and the address were inserted again, its numbering
+    // would restart while the other side's would not, and the peer would reject or stall on
+    // every later message. So entries are removed only when the peer removes its own too
+    // (or is unreachable), and kept (PARKED) while the peer keeps its own.
+    struct ClosingPeer {
+        enum class State {
+            AWAIT_ACK, // sent CLOSE, waiting for the answer
+            ACKING, // answering the peer's CLOSE; removed once the answer is sent
+            PARKED, // the peer keeps its entries (or never answered), so we keep ours
+            REMOVING, // agreed; the CM thread is removing the entries (about 15 ms each on EFA)
+        };
+        std::string name;
+        uint32_t agent_idx;
+        std::unordered_map<size_t, std::vector<fi_addr_t>> addrs;
+        fi_addr_t ctrl_addr; // peer's rail-0 address on our rail 0
+        State state;
+        bool timed_out = false;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    // Installed in every connection (weakly), reset by cleanup() with av_owner_token_.
+    std::shared_ptr<nixlLibfabricReleaseHook> release_hook_;
+    std::mutex close_mutex_;
+    std::condition_variable close_cv_; // a record left AWAIT_ACK or ACKING
+    std::unordered_map<std::string, std::shared_ptr<ClosingPeer>> closing_; // by agent name
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_close_;
+    std::chrono::milliseconds close_timeout_{NIXL_LIBFABRIC_DEFAULT_CLOSE_TIMEOUT_MS};
+    std::chrono::milliseconds reinsert_cooldown_{NIXL_LIBFABRIC_DEFAULT_REINSERT_COOLDOWN_MS};
 
     // Progress thread for rail CQs
     std::thread progress_thread_;
@@ -367,9 +402,57 @@ private:
     // Queues a re-establishment reply for the CM thread; dropped once teardown started.
     void
     queueHandshakeReply(std::shared_ptr<nixlLibfabricConnection> conn);
-    // CM thread body: sends queued re-establishment replies off the progress thread.
+    // CM thread body: sends queued re-establishment replies and close-exchange messages off
+    // the progress thread, and expires close exchanges the peer never answered.
     void
     cmThread();
+
+    // ---- Connection close exchange (libfabric_close.cpp) ----
+    void
+    initCloseExchange();
+    // Release hook: takes a released connection's AV entries and starts the close exchange.
+    bool
+    onConnectionReleased(nixlLibfabricConnection &conn);
+    // Rail-0 receive handler for NIXL_LIBFABRIC_MSG_CLOSE and NIXL_LIBFABRIC_MSG_CLOSE_ACK.
+    void
+    handleCloseMessage(uint64_t msg_type, const std::string &payload, uint32_t sender_idx);
+    void
+    queueCmTask(std::function<void()> task);
+    nixl_status_t
+    sendCloseMessage(nixlLibfabricRailManager::ControlMessageType type,
+                     fi_addr_t dest,
+                     bool kept,
+                     std::function<void(nixl_status_t)> on_complete) const;
+    // Ends a close exchange: removes the entries, or keeps them PARKED.
+    void
+    finishClose(const std::shared_ptr<ClosingPeer> &rec, bool remove, const char *why);
+    // CM thread: removes a REMOVING record's entries, then forgets the record. Until then the
+    // peer cannot be re-added, so an insert never revives an entry that is half removed.
+    void
+    completeRemoval(const std::shared_ptr<ClosingPeer> &rec, const std::string &why);
+    // Removes the record's rail-0 entry for the peer's rail-0 endpoint: the one pair that
+    // carries numbered messages (handshakes, notifications, close messages).
+    void
+    removeControlEntry(ClosingPeer &rec);
+    // CM thread: parks exchanges past their deadline. Returns the next deadline, if any, and
+    // whether any exchange still needs the rails progressed.
+    std::optional<std::chrono::steady_clock::time_point>
+    expireCloses(bool &needs_progress);
+    // Before re-adding a peer from the core: wait for its close exchange and the cooldown.
+    void
+    awaitClose(const std::string &agent_name);
+    // In createAgentConnection(), once the new connection holds its own references: drops a
+    // parked record's references, or ends an exchange a fresh handshake made moot.
+    void
+    absorbClose(const std::string &agent_name, bool before_insert);
+    // Teardown: closes every connection with its peer, waiting at most close_timeout_ms (and
+    // no more than a second) for the answers.
+    void
+    closeAllConnections();
+    nixl_status_t
+    loadRemoteConnInfoImpl(const std::string &remote_agent,
+                           const std::string &remote_conn_info,
+                           bool from_core);
     // Marks a peer rejected for its protocol version; establishConnection() then fails fast.
     void
     rejectHandshake(const std::string &peer_agent_name, uint16_t peer_proto_ver);

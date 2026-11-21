@@ -1135,6 +1135,12 @@ nixlLibfabricRailManager::postControlMessage(
     case ControlMessageType::XFER_ERROR:
         msg_type_value = NIXL_LIBFABRIC_MSG_XFER_ERROR;
         break;
+    case ControlMessageType::CLOSE:
+        msg_type_value = NIXL_LIBFABRIC_MSG_CLOSE;
+        break;
+    case ControlMessageType::CLOSE_ACK:
+        msg_type_value = NIXL_LIBFABRIC_MSG_CLOSE_ACK;
+        break;
     default:
         NIXL_ERROR << "Unknown message type";
         return NIXL_ERR_INVALID_PARAM;

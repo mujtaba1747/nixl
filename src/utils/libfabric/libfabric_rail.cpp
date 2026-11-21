@@ -803,6 +803,12 @@ nixlLibfabricRail::setHandshakeCallback(std::function<void(const std::string &)>
 }
 
 void
+nixlLibfabricRail::setCloseCallback(
+    std::function<void(uint64_t, const std::string &, uint32_t)> callback) {
+    closeCallback = callback;
+}
+
+void
 nixlLibfabricRail::setProgressThreadEnabled(bool enabled) {
     progress_thread_enabled_ = enabled;
 }
@@ -1143,9 +1149,12 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
     nixl_status_t result = NIXL_SUCCESS;
 
     // HANDSHAKE needs no sender: it can arrive before we have inserted the peer into our AV,
-    // and it carries the sender's name in its payload.
-    const bool needs_sender =
-        (msg_type == NIXL_LIBFABRIC_MSG_NOTIFICTION || msg_type == NIXL_LIBFABRIC_MSG_XFER_ERROR);
+    // and it carries the sender's name in its payload. CLOSE and CLOSE_ACK must come from a
+    // peer we hold in our AV: they act on exactly that peer's entries.
+    const bool is_close =
+        (msg_type == NIXL_LIBFABRIC_MSG_CLOSE || msg_type == NIXL_LIBFABRIC_MSG_CLOSE_ACK);
+    const bool needs_sender = (msg_type == NIXL_LIBFABRIC_MSG_NOTIFICTION ||
+                               msg_type == NIXL_LIBFABRIC_MSG_XFER_ERROR || is_close);
     const uint32_t agent_idx = needs_sender ? resolveSourceAddress(src_addr) : kUnknownAgentIdx;
 
     if (needs_sender && agent_idx == kUnknownAgentIdx) {
@@ -1197,6 +1206,13 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
             handshakeCallback(payload);
         } else {
             NIXL_WARN << "No handshake callback set; dropping handshake message";
+        }
+    } else if (is_close) {
+        if (closeCallback) {
+            std::string payload(static_cast<const char *>(req->buffer), comp->len);
+            closeCallback(msg_type, payload, agent_idx);
+        } else {
+            NIXL_WARN << "No close callback set; dropping close message type " << msg_type;
         }
     } else {
         NIXL_ERROR << "Unknown message type: " << std::hex << msg_type << std::dec;
