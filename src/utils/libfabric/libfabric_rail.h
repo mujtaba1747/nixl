@@ -546,6 +546,12 @@ public:
     void
     setHandshakeCallback(std::function<void(const std::string &)> callback);
 
+    /** Set callback for connection-close messages.
+     *  Signature: (msg_type, payload, sender_agent_idx_in_our_table). Called on receipt of a
+     *  NIXL_LIBFABRIC_MSG_DISCONNECT or _DISCONNECT_ACK control message from a known sender. */
+    void
+    setDisconnectCallback(std::function<void(uint64_t, const std::string &, uint32_t)> callback);
+
     /**
      * @brief Enable or disable a progress thread that handles CQ draining.
      *
@@ -691,6 +697,7 @@ private:
     std::function<void(uint64_t, uint32_t)> xferIdCallback;
     std::function<void(const std::string &)> handshakeCallback;
     std::function<void(uint16_t, uint32_t, uint32_t)> xferErrorCallback;
+    std::function<void(uint64_t, const std::string &, uint32_t)> disconnectCallback;
 
     // fi_addr_t -> local agent index, indexed directly by fi_addr_t (dense, as the AV is
     // FI_AV_TABLE). Written at connection setup, read on the completion path.

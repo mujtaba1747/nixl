@@ -19,14 +19,34 @@
 #include "common/nixl_log.h"
 #include "libfabric/libfabric_rail_manager.h"
 
+#include <random>
+
+namespace {
+uint64_t
+makeNonce() {
+    std::random_device rd;
+    uint64_t nonce = 0;
+    while (nonce == 0) { // 0 means "no nonce" on the wire
+        nonce = (static_cast<uint64_t>(rd()) << 32) | rd();
+    }
+    return nonce;
+}
+} // namespace
+
 nixlLibfabricConnection::nixlLibfabricConnection(const std::string &remote_agent,
                                                  size_t agent_index)
     : agent_index_(agent_index),
       remoteAgent_(remote_agent),
-      overall_state_(ConnectionState::DISCONNECTED) {}
+      overall_state_(ConnectionState::DISCONNECTED),
+      local_nonce_(makeNonce()) {}
 
 nixlLibfabricConnection::~nixlLibfabricConnection() {
-    releaseAddresses();
+    if (release_av_.load(std::memory_order_acquire)) {
+        releaseAddresses();
+    } else if (!av_owner_.expired()) {
+        NIXL_DEBUG << "Keeping the AV entries of agent " << remoteAgent_
+                   << ": the peer did not confirm a mutual close";
+    }
 }
 
 void

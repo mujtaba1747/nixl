@@ -803,6 +803,12 @@ nixlLibfabricRail::setHandshakeCallback(std::function<void(const std::string &)>
 }
 
 void
+nixlLibfabricRail::setDisconnectCallback(
+    std::function<void(uint64_t, const std::string &, uint32_t)> callback) {
+    disconnectCallback = callback;
+}
+
+void
 nixlLibfabricRail::setProgressThreadEnabled(bool enabled) {
     progress_thread_enabled_ = enabled;
 }
@@ -930,7 +936,16 @@ nixlLibfabricRail::progressCompletionQueue() {
                 nixlLibfabricReq *req = findRequestFromContext(err_entry.op_context);
                 if (req && req->in_use) {
                     if (req->completion_callback) {
-                        req->completion_callback(NIXL_ERR_BACKEND);
+                        // A control send that the provider could not deliver because the peer
+                        // is gone is reported as such, so a connection close can tell a dead
+                        // peer from a failed send. Data transfers keep NIXL_ERR_BACKEND.
+                        const bool peer_gone = (err_entry.err == FI_EHOSTUNREACH ||
+                                                err_entry.err == FI_ECONNABORTED ||
+                                                err_entry.err == FI_ENOTCONN);
+                        req->completion_callback(
+                            (peer_gone && req->operation_type == nixlLibfabricReq::SEND) ?
+                                NIXL_ERR_REMOTE_DISCONNECT :
+                                NIXL_ERR_BACKEND);
                     }
                     releaseRequest(req);
                 }
@@ -1145,7 +1160,8 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
     // HANDSHAKE needs no sender: it can arrive before we have inserted the peer into our AV,
     // and it carries the sender's name in its payload.
     const bool needs_sender =
-        (msg_type == NIXL_LIBFABRIC_MSG_NOTIFICTION || msg_type == NIXL_LIBFABRIC_MSG_XFER_ERROR);
+        (msg_type == NIXL_LIBFABRIC_MSG_NOTIFICTION || msg_type == NIXL_LIBFABRIC_MSG_XFER_ERROR ||
+         msg_type == NIXL_LIBFABRIC_MSG_DISCONNECT || msg_type == NIXL_LIBFABRIC_MSG_DISCONNECT_ACK);
     const uint32_t agent_idx = needs_sender ? resolveSourceAddress(src_addr) : kUnknownAgentIdx;
 
     if (needs_sender && agent_idx == kUnknownAgentIdx) {
@@ -1197,6 +1213,18 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_
             handshakeCallback(payload);
         } else {
             NIXL_WARN << "No handshake callback set; dropping handshake message";
+        }
+    } else if (msg_type == NIXL_LIBFABRIC_MSG_DISCONNECT ||
+               msg_type == NIXL_LIBFABRIC_MSG_DISCONNECT_ACK) {
+        if (comp->len < sizeof(DisconnectPayload)) {
+            NIXL_ERROR << "Disconnect message too short on rail " << rail_id
+                       << " (len=" << comp->len << ")";
+            result = NIXL_ERR_BACKEND;
+        } else if (disconnectCallback) {
+            std::string payload(static_cast<const char *>(req->buffer), comp->len);
+            disconnectCallback(msg_type, payload, agent_idx);
+        } else {
+            NIXL_WARN << "No disconnect callback set; dropping disconnect message";
         }
     } else {
         NIXL_ERROR << "Unknown message type: " << std::hex << msg_type << std::dec;

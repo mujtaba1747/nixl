@@ -540,6 +540,26 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
     }
 
     initPostThreadPool();
+
+    {
+        size_t timeout_ms = disconnect_timeout_.count();
+        size_t grace_ms = av_release_grace_.count();
+        size_t cooldown_ms = av_reinsert_cooldown_.count();
+        LibfabricUtils::getCustomIntParam(getCustomParams(), "disconnect_timeout_ms", timeout_ms);
+        LibfabricUtils::getCustomIntParam(getCustomParams(), "av_release_grace_ms", grace_ms);
+        LibfabricUtils::getCustomIntParam(
+            getCustomParams(), "av_reinsert_cooldown_ms", cooldown_ms);
+        if (cooldown_ms <= grace_ms) {
+            NIXL_WARN << "av_reinsert_cooldown_ms (" << cooldown_ms
+                      << ") must exceed av_release_grace_ms (" << grace_ms << "); using "
+                      << grace_ms * 2 + 1;
+            cooldown_ms = grace_ms * 2 + 1;
+        }
+        disconnect_timeout_ = std::chrono::milliseconds(timeout_ms);
+        av_release_grace_ = std::chrono::milliseconds(grace_ms);
+        av_reinsert_cooldown_ = std::chrono::milliseconds(cooldown_ms);
+    }
+
     // Initialize Rail Manager which will discover the topology and create all rails.
     try {
         NIXL_INFO << "Rail Manager created with " << rail_manager_.getNumRails() << " rails";
@@ -554,6 +574,10 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
                 });
         rail_manager_.getRail(0).setHandshakeCallback(
             [this](const std::string &payload) { handleHandshake(payload); });
+        rail_manager_.getRail(0).setDisconnectCallback(
+            [this](uint64_t msg_type, const std::string &payload, uint32_t sender_peer_idx) {
+                handleDisconnectMessage(msg_type, payload, sender_peer_idx);
+            });
         rail_manager_.getRail(notification_rail_id)
             .setXferErrorCallback([this](uint16_t notif_xfer_id,
                                          uint32_t sender_peer_idx,
@@ -717,6 +741,13 @@ nixlLibfabricEngine::getConnInfo(std::string &str) const {
 nixl_status_t
 nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
                                         const std::string &remote_conn_info) {
+    return loadRemoteConnInfoImpl(remote_agent, remote_conn_info, /*from_core=*/true);
+}
+
+nixl_status_t
+nixlLibfabricEngine::loadRemoteConnInfoImpl(const std::string &remote_agent,
+                                            const std::string &remote_conn_info,
+                                            bool from_core) {
 
     NIXL_DEBUG << "Loading remote info for agent: " << remote_agent
                << ", info length=" << remote_conn_info.length() << ", info (hex): "
@@ -740,12 +771,23 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
         return status;
     }
 
+    if (from_core) {
+        // A re-add right after a mutual close must not reach the peer before it removed its
+        // entries for us (see closeConnection()). Only the core path waits: the handshake path
+        // runs on the progress thread and answers a peer that already waited.
+        waitOutReinsertCooldown(remote_agent);
+    }
+
     std::shared_ptr<nixlLibfabricConnection> conn_for_handshake;
     {
         std::lock_guard<std::mutex> lock(connection_state_mutex_);
 
-        bool already_exists = (connections_.find(remote_agent) != connections_.end());
-        if (already_exists) {
+        auto existing = connections_.find(remote_agent);
+        if (existing != connections_.end()) {
+            if (from_core) {
+                // The core now uses a connection the peer's handshake created.
+                existing->second->core_owned_.store(true, std::memory_order_release);
+            }
             NIXL_INFO << "Connection for " << remote_agent
                       << " already exists, skipping duplicate loadRemoteConnInfo";
             return NIXL_SUCCESS;
@@ -757,6 +799,8 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
             return conn_status;
         }
 
+        connections_[remote_agent]->core_owned_.store(from_core || remote_agent == localAgent,
+                                                      std::memory_order_release);
         if (remote_agent != localAgent) {
             conn_for_handshake = connections_[remote_agent];
         }
@@ -770,6 +814,8 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
             // would find the stale registration and skip the handshake.
             NIXL_ERROR << "Handshake send to '" << remote_agent << "' failed with status " << hs
                        << "; dropping the connection so a retry starts fresh";
+            // Nothing was sent to the peer, so it holds no state for us: safe to remove.
+            conn_for_handshake->release_av_.store(true, std::memory_order_release);
             retireConnection(conn_for_handshake);
             return hs;
         }
@@ -824,12 +870,10 @@ nixlLibfabricEngine::disconnect(const std::string &remote_agent) {
     nixl_status_t status = conn->disconnect();
     retireConnection(conn);
 
-    if (conn.use_count() > 1) {
-        NIXL_INFO << "Disconnected from " << remote_agent << "; its AV entries are released once "
-                  << "the remaining " << (conn.use_count() - 1)
-                  << " user(s) (loaded remote memory, transfers in flight) let go";
+    if (remote_agent != localAgent) {
+        // Decides whether conn's AV entries may be removed, and tells the peer.
+        closeConnection(conn);
     }
-    // Usually the last reference: releases the AV entries here, outside the engine's locks.
     return status;
 }
 
@@ -919,7 +963,13 @@ nixlLibfabricEngine::createAgentConnection(
         std::optional<uint16_t> rejected_ver;
         {
             std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
-            buffered = (pending_inbound_handshakes_.erase(agent_name) > 0);
+            auto pending = pending_inbound_handshakes_.find(agent_name);
+            if (pending != pending_inbound_handshakes_.end()) {
+                buffered = true;
+                conn->peer_caps_.store(pending->second.first, std::memory_order_release);
+                conn->peer_nonce_.store(pending->second.second, std::memory_order_release);
+                pending_inbound_handshakes_.erase(pending);
+            }
             auto rejected = pending_rejected_handshakes_.find(agent_name);
             if (rejected != pending_rejected_handshakes_.end()) {
                 rejected_ver = rejected->second;
@@ -1552,7 +1602,7 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
 
     // Hold the peer's AV entries until every request this post submits has completed, even if
     // the peer is disconnected meanwhile.
-    backend_handle->conn_ = conn;
+    backend_handle->conn_pin_ = std::make_unique<nixlLibfabricConnPin>(conn);
 
     nixlLibfabricReq::OpType op_type;
     int desc_count = local.descCount();
@@ -1758,7 +1808,7 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
     if (backend_handle->is_completed()) {
         // Nothing of this transfer is left on the wire, so stop pinning the peer's AV entries.
         // Notifications below look the connection up by name and pin it themselves.
-        backend_handle->conn_.reset();
+        backend_handle->conn_pin_.reset();
 
         // Check if any request completed with error
         nixl_status_t err = backend_handle->get_error_status();
@@ -1954,7 +2004,7 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
             nixlLibfabricRailManager::ControlMessageType::NOTIFICATION,
             control_request,
             connection->rail_remote_addr_list_[rail_id][0],
-            [connection](nixl_status_t) {});
+            [pin = std::make_shared<nixlLibfabricConnPin>(connection)](nixl_status_t) {});
 
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "postControlMessage failed on rail " << rail_id << " for fragment "
@@ -2015,7 +2065,8 @@ nixlLibfabricEngine::notifXferErrorPriv(const std::string &remote_agent,
     // Holding the connection keeps the peer's AV entry alive until the send completes.
     auto send_completion = [agent = remote_agent,
                             xfer_id = notif_xfer_id,
-                            connection](nixl_status_t send_status) {
+                            pin = std::make_shared<nixlLibfabricConnPin>(connection)](
+                               nixl_status_t send_status) {
         if (send_status == NIXL_SUCCESS) {
             return;
         }

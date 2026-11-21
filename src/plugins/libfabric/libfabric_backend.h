@@ -132,9 +132,10 @@ public:
     uint16_t post_xfer_id;
     const nixl_xfer_op_t operation_;
     const std::string remote_agent_;
-    // Keeps the peer's AV entries alive while this transfer's requests may still be posted or
-    // in flight: set by postXfer(), dropped by checkXfer() once all of them completed.
-    std::shared_ptr<nixlLibfabricConnection> conn_;
+    // Keeps the peer's AV entries alive, and counts this transfer as in flight to the peer,
+    // while its requests may still be posted or in flight: set by postXfer(), dropped by
+    // checkXfer() once all of them completed.
+    std::unique_ptr<nixlLibfabricConnPin> conn_pin_;
     bool has_notif;
     uint32_t total_notif_msg_len; // Total length of notification message across all fragments
 
@@ -228,6 +229,15 @@ private:
     std::condition_variable cm_cv_;
     std::deque<std::shared_ptr<nixlLibfabricConnection>> pending_replies_;
     std::atomic<bool> cm_thread_stop_{false};
+    // Other work for the CM thread (DISCONNECT_ACKs from the progress thread), under cm_mutex_.
+    std::deque<std::function<void()>> pending_cm_tasks_;
+    // Connections closed on both sides, whose AV entries the CM thread removes once their last
+    // in-flight operation completed and the grace period passed. Under cm_mutex_.
+    struct DeferredRelease {
+        std::shared_ptr<nixlLibfabricConnection> conn;
+        std::chrono::steady_clock::time_point not_before;
+    };
+    std::vector<DeferredRelease> deferred_releases_;
 
     // Progress thread for rail CQs
     std::thread progress_thread_;
@@ -235,6 +245,22 @@ private:
 
     // Mutex for connection state tracking
     mutable std::mutex connection_state_mutex_;
+
+    // Mutual close (see closeConnection()). All under connection_state_mutex_.
+    // Connections waiting for a DISCONNECT_ACK, by agent name.
+    std::unordered_map<std::string, std::shared_ptr<nixlLibfabricConnection>> closing_;
+    // Retired connections whose AV entries we keep because the peer could not confirm a close;
+    // kept so that the peer's own DISCONNECT can still close them later.
+    std::unordered_multimap<std::string, std::shared_ptr<nixlLibfabricConnection>> lingering_;
+    // When each agent's connection was last closed on both sides. Re-adding that agent through
+    // the core waits until av_reinsert_cooldown_ has passed.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> av_tombstones_;
+
+    // Close tunables, from backend params "disconnect_timeout_ms", "av_release_grace_ms" and
+    // "av_reinsert_cooldown_ms".
+    std::chrono::milliseconds disconnect_timeout_{NIXL_LIBFABRIC_DEFAULT_DISCONNECT_TIMEOUT_MS};
+    std::chrono::milliseconds av_release_grace_{NIXL_LIBFABRIC_DEFAULT_AV_RELEASE_GRACE_MS};
+    std::chrono::milliseconds av_reinsert_cooldown_{NIXL_LIBFABRIC_DEFAULT_AV_REINSERT_COOLDOWN_MS};
 
 
     // System runtime type (set during initialization from rail_manager_)
@@ -287,7 +313,8 @@ private:
 
     // Agents whose handshake arrived before the local createAgentConnection had registered
     // them in connections_. Drained inside createAgentConnection.
-    std::unordered_set<std::string> pending_inbound_handshakes_;
+    // Value: the peer's advertised (caps, nonce), applied to the connection when it is created.
+    std::unordered_map<std::string, std::pair<uint32_t, uint64_t>> pending_inbound_handshakes_;
     // Same, for handshakes rejected for their protocol version: agent name -> peer's version.
     std::unordered_map<std::string, uint16_t> pending_rejected_handshakes_;
     std::mutex pending_handshake_mutex_;
@@ -367,9 +394,56 @@ private:
     // Queues a re-establishment reply for the CM thread; dropped once teardown started.
     void
     queueHandshakeReply(std::shared_ptr<nixlLibfabricConnection> conn);
-    // CM thread body: sends queued re-establishment replies off the progress thread.
+    // CM thread body: sends queued re-establishment replies and runs queued tasks off the
+    // progress thread, and removes the AV entries of closed connections when they are due.
     void
     cmThread();
+    // Starts the CM thread if needed. Caller holds cm_mutex_.
+    void
+    ensureCmThreadLocked();
+    void
+    queueCmTask(std::function<void()> task);
+    void
+    sendHandshakeReply(const std::shared_ptr<nixlLibfabricConnection> &conn);
+
+    // Mutual connection close (libfabric_handshake.cpp).
+    // Closes conn, which disconnect() has retired, with the peer: removes its AV entries only if
+    // the peer confirms it removes its own, or is unreachable; otherwise keeps them.
+    void
+    closeConnection(const std::shared_ptr<nixlLibfabricConnection> &conn);
+    // Receiver of NIXL_LIBFABRIC_MSG_DISCONNECT and _DISCONNECT_ACK.
+    void
+    handleDisconnectMessage(uint64_t msg_type,
+                            const std::string &raw_payload,
+                            uint32_t sender_peer_idx);
+    nixl_status_t
+    sendDisconnectMessage(const std::shared_ptr<nixlLibfabricConnection> &conn,
+                          bool ack,
+                          uint8_t status,
+                          std::function<void(nixl_status_t)> on_complete) const;
+    // Polls done() until it holds or timeout passes, progressing the rails when there is no
+    // progress thread. Returns done()'s final value.
+    bool
+    waitWithProgress(const std::function<bool()> &done, std::chrono::milliseconds timeout) const;
+    // Marks conn's AV entries for removal and hands it to the CM thread, which removes them once
+    // nothing is in flight and the grace period passed. Records the close for the cooldown.
+    void
+    scheduleRelease(const std::shared_ptr<nixlLibfabricConnection> &conn);
+    // Removes conn's AV entries and drops notification state still waiting on the peer.
+    void
+    releasePeer(const std::shared_ptr<nixlLibfabricConnection> &conn);
+    // Removes now any idle connection to agent_name still waiting for its deferred release.
+    void
+    flushPendingRelease(const std::string &agent_name);
+    // Before the core re-adds agent_name: waits until the cooldown after its last close passed.
+    void
+    waitOutReinsertCooldown(const std::string &agent_name);
+    // loadRemoteConnInfo(), and the same from a handshake carrying the peer's connection info
+    // (from_core == false): such a connection is not one the core knows about.
+    nixl_status_t
+    loadRemoteConnInfoImpl(const std::string &remote_agent,
+                           const std::string &remote_conn_info,
+                           bool from_core);
     // Marks a peer rejected for its protocol version; establishConnection() then fails fast.
     void
     rejectHandshake(const std::string &peer_agent_name, uint16_t peer_proto_ver);

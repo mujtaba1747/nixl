@@ -35,7 +35,8 @@ class nixlLibfabricRailManager;
 struct nixlLibfabricConnection : public nixlBackendConnMD {
     nixlLibfabricConnection(const std::string &remote_agent, size_t agent_index);
 
-    /** Removes the peer's addresses from every local rail's AV (see releaseAddresses()). */
+    /** Removes the peer's addresses from every local rail's AV if release_av_ is set (see
+     *  releaseAddresses()); otherwise leaves them for the AV to free when it is closed. */
     ~nixlLibfabricConnection();
 
     nixlLibfabricConnection(const nixlLibfabricConnection &) = delete;
@@ -71,6 +72,34 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
     std::vector<char *> src_ep_names_; // Rail endpoint names
     std::atomic<ConnectionState> overall_state_; // Current connection state
 
+    // Whether the destructor may remove this connection's AV entries. Off by default: removing
+    // a live peer's entries resets the provider's per-peer message sequence on our side only,
+    // and an EFA peer that still holds the old sequence aborts the process when we send to it
+    // again. Set only where the peer cannot hold such state for us: it confirmed the close
+    // (DISCONNECT_ACK), it is unreachable, or we never sent it anything.
+    std::atomic<bool> release_av_{false};
+
+    // Set when the core loaded this peer's connection info (loadRemoteConnInfo from the agent),
+    // as opposed to the connection being created from the peer's handshake alone. A peer's
+    // DISCONNECT closes only connections the core does not use.
+    std::atomic<bool> core_owned_{false};
+
+    // Handshake-advertised state. local_nonce_ identifies this connection in our handshakes and
+    // close messages; peer_nonce_ and peer_caps_ come from the peer's latest handshake
+    // (0 for a peer that sends none, i.e. an older NIXL).
+    const uint64_t local_nonce_;
+    std::atomic<uint64_t> peer_nonce_{0};
+    std::atomic<uint32_t> peer_caps_{0};
+
+    // Operations in flight to the peer: posted transfers until checkXfer() sees them complete,
+    // and queued control sends until their completion. disconnect() waits for zero before it
+    // sends DISCONNECT, which must be the last message on this connection.
+    std::atomic<int> inflight_{0};
+
+    // Outcome of a DISCONNECT sent on this connection (DisconnectResult), written by the ACK
+    // handler or the send's completion and read by disconnect().
+    std::atomic<int> close_result_{0};
+
     // The rail manager whose AVs hold rail_remote_addr_list_. Weak, and expired by the engine
     // at teardown, so a connection that outlives the rails (held by a callback in a request
     // pool, say) leaves the AVs to be closed with them instead of touching freed rails.
@@ -85,6 +114,36 @@ struct nixlLibfabricConnection : public nixlBackendConnMD {
     uint16_t rejected_peer_proto_ver_ = 0;
     std::mutex handshake_mutex_;
     std::condition_variable handshake_cv_;
+};
+
+/** Outcome of a DISCONNECT, in nixlLibfabricConnection::close_result_. */
+enum DisconnectResult : int {
+    NIXL_LIBFABRIC_CLOSE_PENDING = 0,
+    NIXL_LIBFABRIC_CLOSE_RELEASED, // Peer removes its entries for us: we may remove ours
+    NIXL_LIBFABRIC_CLOSE_KEPT, // Peer keeps its entries for us: we must keep ours
+    NIXL_LIBFABRIC_CLOSE_UNREACHABLE, // DISCONNECT could not reach the peer: it is gone
+    NIXL_LIBFABRIC_CLOSE_SEND_FAILED, // DISCONNECT failed otherwise: outcome unknown
+};
+
+/** Counts one in-flight operation on a connection for as long as it lives, and keeps the
+ *  connection, and so its AV entries, alive with it. */
+class nixlLibfabricConnPin {
+public:
+    explicit nixlLibfabricConnPin(std::shared_ptr<nixlLibfabricConnection> conn)
+        : conn_(std::move(conn)) {
+        conn_->inflight_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    ~nixlLibfabricConnPin() {
+        conn_->inflight_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    nixlLibfabricConnPin(const nixlLibfabricConnPin &) = delete;
+    nixlLibfabricConnPin &
+    operator=(const nixlLibfabricConnPin &) = delete;
+
+private:
+    std::shared_ptr<nixlLibfabricConnection> conn_;
 };
 
 #endif // NIXL_SRC_PLUGINS_LIBFABRIC_LIBFABRIC_CONNECTION_H

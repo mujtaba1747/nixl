@@ -65,6 +65,16 @@ constexpr const char *NIXL_HANDSHAKE_TAG_V1_IDX = "idx";
 constexpr const char *NIXL_HANDSHAKE_TAG_NAME = "name";
 constexpr const char *NIXL_HANDSHAKE_TAG_HAS_CONN = "has_conn";
 constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
+// Optional trailing fields, after "conn" (or "has_conn"). Older peers stop reading before them,
+// so adding them needs no protocol version bump; a handshake without them means caps = 0.
+constexpr const char *NIXL_HANDSHAKE_TAG_CAPS = "caps";
+constexpr const char *NIXL_HANDSHAKE_TAG_NONCE = "nonce";
+
+// Capability bits a peer advertises in the handshake "caps" field.
+// DISCONNECT: the peer understands NIXL_LIBFABRIC_MSG_DISCONNECT and _DISCONNECT_ACK and only
+// removes a live peer's AV entries through that exchange.
+#define NIXL_LIBFABRIC_CAP_DISCONNECT 0x1u
+#define NIXL_LIBFABRIC_LOCAL_CAPS (NIXL_LIBFABRIC_CAP_DISCONNECT)
 
 // Wire-protocol version of the libfabric plugin, exchanged in the handshake. Bump it on any
 // incompatible imm_data or control-message change. 1: 8-bit agent index in imm_data (sends
@@ -101,6 +111,18 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
 // to a peer's fresh handshake. Carries protocol version, sender name, and
 // optionally connection info. See libfabric_handshake.cpp for wire-format details.
 #define NIXL_LIBFABRIC_MSG_HANDSHAKE 8
+// Mutual close of a connection, so both sides remove their AV entries for each other together.
+// Sent only to peers that advertised NIXL_LIBFABRIC_CAP_DISCONNECT: an older peer treats an
+// unknown type as an error. Values are compared with ==, so 3 and 5 are free.
+#define NIXL_LIBFABRIC_MSG_DISCONNECT 3
+#define NIXL_LIBFABRIC_MSG_DISCONNECT_ACK 5
+
+// Mutual close timing defaults (milliseconds). The cooldown must exceed the grace period plus
+// the time the peer takes to progress its completions, or a quick re-add can reach the peer
+// before it removed its entries for us.
+#define NIXL_LIBFABRIC_DEFAULT_DISCONNECT_TIMEOUT_MS 5000
+#define NIXL_LIBFABRIC_DEFAULT_AV_RELEASE_GRACE_MS 200
+#define NIXL_LIBFABRIC_DEFAULT_AV_REINSERT_COOLDOWN_MS 2000
 
 // Single-operation immediate data extraction (no intermediate shifts)
 #define NIXL_GET_MSG_TYPE_FROM_IMM(data) ((data) & NIXL_MSG_TYPE_MASK)
@@ -143,6 +165,27 @@ struct BinaryNotificationHeader {
 struct XferErrorPayload {
     uint32_t final_completions; // Writes that completed on the initiator and will reach the target
 } __attribute__((packed));
+
+/**
+ * @brief Payload of NIXL_LIBFABRIC_MSG_DISCONNECT and _DISCONNECT_ACK, followed by the sender's
+ * agent name
+ *
+ * The nonces identify the connection being closed: each side picks one per connection and sends
+ * it in its handshakes, so a message about an older connection to the same agent is ignored.
+ */
+struct DisconnectPayload {
+    uint64_t sender_nonce; // The sender's nonce for this connection
+    uint64_t receiver_nonce; // The receiver's nonce, as last seen in its handshake
+    uint8_t status; // _ACK only: one of the DisconnectStatus values
+} __attribute__((packed));
+
+enum DisconnectStatus : uint8_t {
+    // The receiver unregistered its connection and removes its AV entries for the sender.
+    NIXL_LIBFABRIC_DISCONNECT_RELEASED = 0,
+    // The receiver keeps its AV entries (its core still uses the connection), so the sender
+    // must keep its own too.
+    NIXL_LIBFABRIC_DISCONNECT_KEPT = 1,
+};
 
 /**
  * @brief Metadata for fragment 0 only (10 bytes)
